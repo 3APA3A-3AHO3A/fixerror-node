@@ -447,7 +447,13 @@ P1=$(stat -c %a "$NPD/key" 2>/dev/null); KEY1=$(cat "$NPD/key.pub" 2>/dev/null)
 RH_LIB_ONLY=1 bash -c 'source "'"$ROOT"'/setup.sh"; NODE_PULL_DIR="'"$NPD"'"; SERVER_LABEL=x; node_pull_key' >/dev/null 2>&1
 [[ -n "$KEY1" && "$KEY1" == "$(cat "$NPD/key.pub")" ]] && ok "ключ ноды не пересоздаётся (строка на панели осталась бы чужой)" \
                                         || bad "повторный запуск сменил ключ ноды"
-[[ "$P1" == "600" ]] && ok "ключ ноды с правами 600" || bad "ключ ноды с правами $P1"
+# На Windows (NTFS) chmod ничего не делает — права там не проверить
+_pt=$(mktemp); chmod 600 "$_pt"
+if [[ "$(stat -c %a "$_pt" 2>/dev/null)" != "600" ]]; then
+    echo "  — файловая система не хранит права (Windows), проверку прав ключа пропускаю"
+elif [[ "$P1" == "600" ]]; then ok "ключ ноды с правами 600"
+else bad "ключ ноды с правами $P1"; fi
+rm -f "$_pt"
 fi
 LBL=$(RH_LIB_ONLY=1 bash -c 'source "'"$ROOT"'/setup.sh"; SERVER_LABEL="Fin\"land \$(id) 3"; validate_node_label; echo "$SERVER_LABEL"')
 [[ "$LBL" == "Finland (id) 3" ]] && ok "из имени ноды вырезаются кавычки и \$ (оно попадает в файлы)" \
@@ -591,7 +597,8 @@ web_run() {   # $1 — что вернёт nginx -t (0/1); печатает ит
         systemctl(){ return 0; }
         openssl(){ local o; while [[ $# -gt 0 ]]; do case "$1" in -keyout|-out) o="$2"; echo x > "$o"; shift;; esac; shift; done; return 0; }
         if comp_web_site >/dev/null 2>&1; then echo "ИТОГ=OK"; else echo "ИТОГ=FAIL"; fi
-        [[ -L "$NGINX_ENABLED/stub.conf" ]] && echo "ОПУБЛИКОВАН"
+        # -e, а не -L: в Git Bash на Windows ln -s делает копию, а не ссылку
+        [[ -e "$NGINX_ENABLED/stub.conf" ]] && echo "ОПУБЛИКОВАН"
         head -1 "$NGINX_AVAIL/stub.conf" 2>/dev/null
         ls "$RH_BACKUP_DIR" 2>/dev/null | sed "s/^/БЭКАП:/"
     ' 2>&1
