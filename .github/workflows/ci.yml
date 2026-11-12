@@ -1,0 +1,32 @@
+name: Проверка
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Права на запись не нужны: CI ничего не коммитит.
+# Раньше он пересобирал setup.sh и делал свой коммит — из-за этого после
+# каждого пуша приходилось делать git pull, а в сгенерированном файле
+# возникали конфликты. Теперь он только проверяет и краснеет.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Установить shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Прогнать тесты
+        run: bash tests/run-tests.sh
+
+      - name: Подсказка, если setup.sh устарел
+        if: failure()
+        run: |
+          echo "::error::Если тест «setup.sh собран из текущего lib/» красный —"
+          echo "::error::выполните локально: python build.py, затем закоммитьте setup.sh"

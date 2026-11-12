@@ -1,0 +1,98 @@
+#!/bin/bash
+# Уведомления в Telegram — один скрипт для панели и нод.
+# Ставится в /usr/local/sbin/remnawave-notify (владелец root: его вызывает PAM).
+#
+#   remnawave-notify "текст"           — отправить сообщение
+#   remnawave-notify --ssh-login       — из PAM при входе по SSH
+#   remnawave-notify --boot            — из cron при загрузке сервера
+#   remnawave-notify --run-backup      — панель: запустить бэкап и сообщить, если он не удался
+#   remnawave-notify --watch           — нода: следить за контейнером remnanode (служба systemd)
+#   remnawave-notify --planned "что"   — нода: предупредить, что remnanode сейчас перезапустят
+#                                        намеренно; --watch тогда не шлёт «нода упала»
+#
+# Настройки (TG_BOT_TOKEN, TG_CHAT_ID, TG_TOPIC_ID, TG_PROXY, SERVER_LABEL, NOTIFY_ENABLED):
+#   на панели — /opt/remnawave/host/notify.env, на ноде — /etc/remnawave-notify.env.
+# NOTIFY_ENABLED=0 выключает отправку (режим обкатки).
+
+if [ -r /opt/remnawave/host/notify.env ]; then ENV_FILE=/opt/remnawave/host/notify.env
+else ENV_FILE=/etc/remnawave-notify.env; fi
+[ -r "$ENV_FILE" ] && . "$ENV_FILE"
+
+PLANNED=/run/remnawave-notify.planned   # метка планового перезапуска
+DOWN=/run/remnawave-notify.down         # метка «нода лежит, уже сообщили»
+
+send() {
+    [ "${NOTIFY_ENABLED:-1}" = 1 ] || return 0
+    [ -n "${TG_BOT_TOKEN:-}" ] && [ -n "${TG_CHAT_ID:-}" ] || return 0
+    local args=(-s --max-time 15 --retry 2 -X POST)
+    [ -n "${TG_PROXY:-}" ] && args+=(-x "$TG_PROXY")
+    args+=(-d "chat_id=$TG_CHAT_ID" -d "parse_mode=HTML"
+           --data-urlencode "text=🖥 <b>${SERVER_LABEL:-$(hostname)}</b>
+$1")
+    [ -n "${TG_TOPIC_ID:-}" ] && args+=(-d "message_thread_id=$TG_TOPIC_ID")
+    curl "${args[@]}" "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" >/dev/null 2>&1
+}
+
+now() { date '+%Y-%m-%d %H:%M:%S %Z'; }
+hm()  { date '+%H:%M:%S'; }
+
+# Плановая метка действует 10 минут: если перезапуск затянулся дольше, это уже авария
+planned_reason() {
+    [ -f "$PLANNED" ] && [ -n "$(find "$PLANNED" -mmin -10 2>/dev/null)" ] && cat "$PLANNED"
+}
+
+case "${1:-}" in
+    --ssh-login)
+        [ "${PAM_TYPE:-}" = open_session ] || exit 0
+        # node-pull — ноды забирают сертификат и сайт, это не вход человека
+        [ "${PAM_USER:-}" = node-pull ] && exit 0
+        send "🔐 <b>Вход по SSH</b>
+Пользователь: <code>${PAM_USER:-?}</code>
+IP: <code>${PAM_RHOST:-?}</code>
+Время: $(now)" &
+        exit 0 ;;
+    --boot)
+        sleep 8
+        send "♻️ Сервер загрузился ($(now))" ;;
+    --run-backup)
+        # Сам бэкап делает rw-backup-restore; здесь только проверяем, что он удался
+        LOG=/var/log/rw_backup_cron.log
+        out=$(/opt/rw-backup-restore/backup-restore.sh backup 2>&1)
+        rc=$?
+        printf '%s\n%s\n' "=== $(now)" "$out" >> "$LOG"
+        if [ $rc -ne 0 ] || printf '%s' "$out" | grep -q -e '\[ERROR\]' -e '❌'; then
+            send "❌ <b>Бэкап не удался</b> ($(now))
+Подробности: <code>$LOG</code>"
+        fi
+        fresh=$(find /opt/rw-backup-restore/backup -maxdepth 1 -name '*.tar.gz' -mmin -120 2>/dev/null | head -n 1)
+        [ -n "$fresh" ] || send "⚠️ <b>Нет свежего бэкапа</b>: нового архива нет больше 2 часов" ;;
+    --planned)
+        printf '%s' "${2:-плановые работы}" > "$PLANNED" ;;
+    --watch)
+        # docker events отдаёт события контейнера remnanode; при падении — тревога,
+        # при плановом перезапуске — одно спокойное сообщение после подъёма
+        docker events --filter container=remnanode --filter event=start --filter event=die \
+            --format '{{.Action}}' 2>/dev/null |
+        while read -r ev; do
+            case "$ev" in
+                die)
+                    [ -n "$(planned_reason)" ] && continue
+                    [ -f "$DOWN" ] || { send "⚠️ <b>Нода упала</b>: remnanode остановился ($(hm))"; touch "$DOWN"; } ;;
+                start)
+                    reason=$(planned_reason)
+                    if [ -n "$reason" ]; then
+                        send "🔄 Плановый перезапуск ноды: ${reason}. Нода снова работает ($(hm))"
+                        rm -f "$PLANNED" "$DOWN"
+                    elif [ -f "$DOWN" ]; then
+                        send "✅ <b>Нода поднялась</b>: remnanode запущен ($(hm))"; rm -f "$DOWN"
+                    fi ;;
+            esac
+        done
+        exit 1 ;;   # docker events завершился (перезапуск docker) — systemd запустит заново
+    "")
+        echo "Использование: $0 \"текст\" | --ssh-login | --boot | --run-backup | --watch | --planned \"что\"" >&2
+        exit 1 ;;
+    *)
+        send "$1" ;;
+esac
+exit 0
