@@ -253,7 +253,9 @@ C=$NODE_PULL_DIR
 SSL=$NGINX_SSL
 WWW=$STUB_ROOT
 STATE=/var/lib/node-pull; mkdir -p \$STATE
-log(){ echo "\$*"; logger -t node-pull "\$*"; }
+# Под systemd вывод и так уходит в журнал — echo только при ручном запуске,
+# иначе каждая строка в журнале двоится
+log(){ [ -z "\${JOURNAL_STREAM:-}" ] && echo "\$*"; logger -t node-pull "\$*"; }
 
 # Только один забор за раз: таймер и ручной запуск не должны мешать друг другу
 exec 9>/run/node-pull.lock

@@ -2457,7 +2457,9 @@ DIR=$GEODATA_DIR
 URL=$GEODATA_URL
 CHECK=0; NO_RESTART=0
 case "\${1:-}" in --check) CHECK=1 ;; --no-restart) NO_RESTART=1 ;; esac
-log(){ echo "\$*"; logger -t geo-update "\$*"; }
+# Под systemd вывод и так уходит в журнал — echo только при ручном запуске,
+# иначе каждая строка в журнале двоится
+log(){ [ -z "\${JOURNAL_STREAM:-}" ] && echo "\$*"; logger -t geo-update "\$*"; }
 
 mkdir -p "\$DIR"
 TMP=\$(mktemp -d /var/tmp/geo.XXXXXX); trap 'rm -rf "\$TMP"' EXIT
@@ -2808,7 +2810,9 @@ C=$NODE_PULL_DIR
 SSL=$NGINX_SSL
 WWW=$STUB_ROOT
 STATE=/var/lib/node-pull; mkdir -p \$STATE
-log(){ echo "\$*"; logger -t node-pull "\$*"; }
+# Под systemd вывод и так уходит в журнал — echo только при ручном запуске,
+# иначе каждая строка в журнале двоится
+log(){ [ -z "\${JOURNAL_STREAM:-}" ] && echo "\$*"; logger -t node-pull "\$*"; }
 
 # Только один забор за раз: таймер и ручной запуск не должны мешать друг другу
 exec 9>/run/node-pull.lock
