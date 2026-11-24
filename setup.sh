@@ -2,7 +2,7 @@
 # ЭТОТ ФАЙЛ СОБРАН АВТОМАТИЧЕСКИ ИЗ lib/*.sh — НЕ РЕДАКТИРУЙТЕ ЕГО ВРУЧНУЮ.
 # Правки вносятся в lib/, затем: python3 build.py
 # Любое изменение здесь будет затёрто при следующей сборке.
-# Собрано из: 00-header.sh, 05-ui.sh, 06-spinner.sh, 07-probes.sh, 10-helpers.sh, 20-prompts.sh, 30-state.sh, 40-system.sh, 45-preflight.sh, 50-security.sh, 52-rknblock.sh, 60-node.sh, 62-geodata.sh, 70-web.sh, 80-notify.sh, 85-extras.sh, 86-egress.sh, 90-install.sh, 92-repair.sh, 94-check.sh, 95-menu.sh, 99-main.sh
+# Собрано из: 00-header.sh, 05-ui.sh, 06-spinner.sh, 07-probes.sh, 10-helpers.sh, 20-prompts.sh, 30-state.sh, 40-system.sh, 45-preflight.sh, 50-security.sh, 52-rknblock.sh, 60-node.sh, 62-geodata.sh, 64-xrayclient.sh, 70-web.sh, 80-notify.sh, 85-extras.sh, 86-egress.sh, 90-install.sh, 92-repair.sh, 94-check.sh, 95-menu.sh, 99-main.sh
 
 # ===== lib/00-header.sh ================================================
 # ##########################################################################
@@ -94,6 +94,22 @@ RKN_ALLOW_FILE="/etc/fixerror-node/rkn-allow.txt"  # сети, которые н
 RKN_LISTS_URL="https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/main/public"
 RKN_LISTS="government_networks.list antiscanner.list skipa.list"
 UFW_BEFORE6="/etc/ufw/before6.rules"
+# Сети CDN-провайдера по умолчанию: на CDN-нодах клиенты приходят с них, и
+# если списки РКН их когда-нибудь заденут, нода останется без клиентов
+CDN_RKN_ALLOW_DEFAULT="188.72.110.0/22"
+# Свой xray-клиент на нодах в РФ: через него ходят Telegram-уведомления ноды
+# (api.telegram.org из РФ закрыт). Конфиг — «Автовыбор» из подписки FixErrorVPN,
+# обновляется таймером. Слушает только 127.0.0.1.
+XRAYC_BIN="/usr/local/bin/xray"
+XRAYC_CFG="/usr/local/etc/xray/config.json"
+XRAYC_UNIT="/etc/systemd/system/xray.service"
+XRAYC_DROPIN="/etc/systemd/system/xray.service.d/20-geodata.conf"
+XRAYC_SUB_FILE="/etc/fixerror-node/xray-sub.url"     # ссылка подписки (секрет, 600)
+XRAYC_UPDATER="/usr/local/sbin/xray-sub-update"
+XRAYC_SUB_UNIT="/etc/systemd/system/xray-sub-update.service"
+XRAYC_SUB_TIMER="/etc/systemd/system/xray-sub-update.timer"
+XRAYC_REL_URL="https://github.com/XTLS/Xray-core/releases/latest/download"
+XRAYC_PROXY="socks5h://127.0.0.1:10808"
 
 NODE_PULL_BIN="/usr/local/sbin/node-pull"
 NODE_PULL_DIR="/etc/node-pull"
@@ -586,7 +602,7 @@ print_summary() {
         case "$ADMIN_PASS_SOURCE" in
             manual) echo "Пароль учётки:   задан вами вручную" ;;
             kept)   echo "Пароль учётки:   не менялся" ;;
-            *)      echo "Пароль учётки:   ${ADMIN_PASS:-—}" ;;
+            *)      echo "Пароль учётки:   сгенерирован, показан один раз на экране (в файлы не пишется)" ;;
         esac
         echo "Нода:            ${SERVER_LABEL:-—} (${NODE_ROLE:-reality})"
         echo "IP сервера:      ${SERVER_IP:-—}"
@@ -977,8 +993,11 @@ ask_ssh_params() {
 # и вызов "[[ ... ]] && ask_telegram" убивал бы весь скрипт из-за set -e.
 ask_telegram() {
     [[ -n "$TG_ASKED" || -n "$NONINTERACTIVE" ]] && return 0
-    [[ -z "$TG_BOT_TOKEN" ]] && read -ep "Telegram BOT_TOKEN: " TG_BOT_TOKEN
-    [[ -z "$TG_CHAT_ID" ]]   && read -ep "Telegram CHAT_ID (супергруппа: начинается с -100): " TG_CHAT_ID
+    # Уведомления обязательны: без них о падении ноды никто не узнает. Пропустить
+    # вопрос нельзя — так нода однажды и осталась без уведомлений.
+    # Ввода нет (конец stdin) — выходим, а не крутимся в цикле вечно
+    while [[ -z "$TG_BOT_TOKEN" ]]; do read -ep "Telegram BOT_TOKEN: " TG_BOT_TOKEN || return 0; done
+    while [[ -z "$TG_CHAT_ID" ]];   do read -ep "Telegram CHAT_ID (супергруппа: начинается с -100): " TG_CHAT_ID || return 0; done
     [[ -z "$TG_TOPIC_ID" ]]  && read -ep "Topic ID темы супергруппы (Enter — если без топиков): " TG_TOPIC_ID
     # Прокси нужен, если сервер не достаёт api.telegram.org напрямую (ноды в РФ).
     # Спрашиваем здесь, а не в момент установки: все вопросы должны быть заданы заранее.
@@ -988,6 +1007,36 @@ ask_telegram() {
         read -ep "Прокси для Telegram: " TG_PROXY
     fi
     TG_ASKED=1
+    return 0
+}
+
+# Ссылка подписки FixErrorVPN для xray-клиента (ключ сервисного пользователя,
+# например MONITORING). Проверяется только вид: https://…
+ask_xray_sub() {
+    XRAY_SUB_URL=$(printf '%s' "${XRAY_SUB_URL:-}" | tr -d '[:space:]')
+    while [[ ! "$XRAY_SUB_URL" =~ ^https://[^/]+/.+ ]]; do
+        [[ -n "$NONINTERACTIVE" ]] && { echo "  [СБОЙ] XRAY_SUB_URL в конфиге не задан или некорректен"; return 1; }
+        echo "  Ссылка подписки FixErrorVPN сервисного пользователя (например, MONITORING):"
+        read -ep "  https://…: " XRAY_SUB_URL || return 1
+        XRAY_SUB_URL=$(printf '%s' "$XRAY_SUB_URL" | tr -d '[:space:]')
+    done
+    return 0
+}
+
+# CDN-нода: сети CDN-провайдера — в исключения защиты от проберов.
+# «-» — не добавлять ничего.
+ask_cdn_allow() {
+    [[ "${NODE_ROLE:-reality}" == "cdn" ]] && rkn_block_enabled || return 0
+    [[ " ${RKN_ALLOW:-} " == *" $CDN_RKN_ALLOW_DEFAULT "* ]] && return 0
+    local a=""
+    if [[ -z "$NONINTERACTIVE" && -z "${CDN_ALLOW_ASKED:-}" ]]; then
+        read -ep "Сети CDN-провайдера, которые защита от проберов не тронет (Enter — $CDN_RKN_ALLOW_DEFAULT, «-» — никакие): " a || a=""
+    fi
+    CDN_ALLOW_ASKED=1
+    a=$(printf '%s' "$a" | tr -s '[:space:],' ' ' | sed 's/^ //; s/ $//')
+    [[ "$a" == "-" ]] && return 0
+    [[ -z "$a" ]] && a="$CDN_RKN_ALLOW_DEFAULT"
+    RKN_ALLOW=$(printf '%s %s' "${RKN_ALLOW:-}" "$a" | sed 's/^ //')
     return 0
 }
 
@@ -1097,6 +1146,11 @@ detect_existing_setup() {
         done
         [[ -n "$TG_BOT_TOKEN" && -z "${SETUP_TG:-}" ]] && SETUP_TG="y"
     fi
+    # Свой xray-клиент (ноды в РФ): ссылка подписки — из его файла
+    if [[ -z "${XRAY_SUB_URL:-}" && -s "$XRAYC_SUB_FILE" ]]; then
+        XRAY_SUB_URL=$(tr -d '[:space:]' < "$XRAYC_SUB_FILE")
+        INSTALL_XRAY_CLIENT="y"
+    fi
     # Имя ноды — ещё и из комментария ключа node-pull
     if [[ -z "${SERVER_LABEL:-}" && -f "$NODE_PULL_DIR/key.pub" ]]; then
         SERVER_LABEL=$(awk '{ $1=""; $2=""; sub(/^  /,""); sub(/^node-pull /,""); print }' "$NODE_PULL_DIR/key.pub")
@@ -1116,6 +1170,7 @@ save_state() {
                   SSH_PUBLIC_KEY SSH_EXTRA_KEYS SSH_PORT ADMIN_USER \
                   AGENT_USER AGENT_SSH_KEYS GEODATA RKN_BLOCK RKN_ALLOW INSTALL_WARP INSTALL_WARP_NATIVE \
                   INSTALL_PSIPHON PSIPHON_REGION INSTALL_SPEEDTEST SETUP_TG \
+                  INSTALL_XRAY_CLIENT XRAY_SUB_URL \
                   TG_BOT_TOKEN TG_CHAT_ID TG_TOPIC_ID TG_PROXY; do
             printf '%s=%q\n' "$_v" "${!_v-}"
         done
@@ -1785,8 +1840,10 @@ comp_user() {
             ADMIN_PASS=$(openssl rand -base64 18); ADMIN_PASS_SOURCE="generated"
         fi
         echo "$ADMIN_USER:$ADMIN_PASS" | chpasswd
+        # Сам пароль сюда не печатаем: вывод шага целиком уходит в журнал
+        # установки. Он показывается один раз — в итоге на экране.
         [[ "$ADMIN_PASS_SOURCE" == "generated" ]] && \
-            echo "!!! ПАРОЛЬ $ADMIN_USER@$(hostname): $ADMIN_PASS  (повторю в итоговом отчёте)"
+            echo "  Пароль $ADMIN_USER сгенерирован — покажу один раз в итоге на экране."
     else
         # Согласие на смену пароля уже получено в ask_admin_password
         if [[ "$ADMIN_PASS_SOURCE" == "manual" && -n "$ADMIN_PASS" ]]; then
@@ -2913,6 +2970,247 @@ comp_geodata() {
     return 0
 }
 
+# ===== lib/64-xrayclient.sh ============================================
+# ##########################################################################
+#  СВОЙ XRAY-КЛИЕНТ НА НОДАХ В РФ
+#  Через него ходят Telegram-уведомления ноды: api.telegram.org из РФ закрыт.
+#  Конфиг — «Автовыбор» из подписки FixErrorVPN, обновление раз в 6 часов.
+# ##########################################################################
+
+# Зачем подписка, а не конфиг руками. Серверы в панели добавляются и меняются,
+# а конфиг, вписанный руками один раз, тихо устаревает: однажды все его серверы
+# окажутся мёртвыми, и нода перестанет сообщать, что с ней что-то не так.
+# Из подписки берётся конфиг «Автовыбор» шаблона AutoBalancer — тот же, что
+# у клиентов: российское напрямую, остальное через лучший живой сервер.
+#
+# Что защищает от поломки. Новый конфиг ставится, только если прошёл
+# xray -test и через него открылся Telegram; иначе возвращается прежний.
+# Входы всегда принудительно на 127.0.0.1:10808/10809, что бы ни пришло.
+
+xrayc_wanted() {
+    [[ "${INSTALL_XRAY_CLIENT:-n}" =~ ^[Yy]$ ]] && return 0
+    return 1
+}
+
+# Архитектура в имени архива релиза Xray
+xrayc_asset_name() {
+    case "$(uname -m)" in
+        x86_64|amd64)  echo "Xray-linux-64.zip" ;;
+        aarch64|arm64) echo "Xray-linux-arm64-v8a.zip" ;;
+        *) return 1 ;;
+    esac
+    return 0
+}
+
+# Бинарник из официального релиза XTLS, со сверкой SHA-256 из .dgst
+xrayc_install_bin() {
+    local asset t want got
+    asset=$(xrayc_asset_name) || { echo "  [СБОЙ] архитектура $(uname -m) не поддерживается"; return 1; }
+    t=$(mktemp -d)
+    if ! curl -fsSL --retry 2 --max-time 180 -o "$t/x.zip" "$XRAYC_REL_URL/$asset" \
+       || ! curl -fsSL --retry 2 --max-time 60 -o "$t/x.dgst" "$XRAYC_REL_URL/$asset.dgst"; then
+        rm -rf "$t"; echo "  [СБОЙ] не удалось скачать Xray с GitHub"; return 1
+    fi
+    want=$(awk -F'= *' 'toupper($1) ~ /^SHA2-256/ {print $2; exit}' "$t/x.dgst" | tr -d '[:space:]')
+    got=$(sha256sum "$t/x.zip" | awk '{print $1}')
+    if [[ -z "$want" || "$want" != "$got" ]]; then
+        rm -rf "$t"; echo "  [СБОЙ] контрольная сумма архива Xray не совпала — не ставлю"; return 1
+    fi
+    if ! unzip -o -q "$t/x.zip" xray -d "$t" || ! "$t/xray" version >/dev/null 2>&1; then
+        rm -rf "$t"; echo "  [СБОЙ] архив Xray не распаковался"; return 1
+    fi
+    if [[ -x "$XRAYC_BIN" ]] && cmp -s "$t/xray" "$XRAYC_BIN"; then
+        echo "  Xray уже последней версии: $("$XRAYC_BIN" version | awk 'NR==1{print $2}')"
+    else
+        install -m 755 "$t/xray" "$XRAYC_BIN"
+        echo "  Xray: $("$XRAYC_BIN" version | awk 'NR==1{print $2}')"
+    fi
+    rm -rf "$t"
+    return 0
+}
+
+xrayc_write_units() {
+    # Своя служба — только если её ещё нет: на нодах, где xray ставили
+    # установщиком XTLS, его служба остаётся как есть
+    if ! systemctl cat xray.service >/dev/null 2>&1; then
+        cat <<UNIT > "$XRAYC_UNIT"
+[Unit]
+Description=Xray-клиент ноды (Telegram-уведомления), только 127.0.0.1
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=nobody
+NoNewPrivileges=true
+ExecStart=$XRAYC_BIN run -config $XRAYC_CFG
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    fi
+    # Geo-базы — те же, что у ноды: их и так раз в 3 дня обновляет geo-update
+    mkdir -p "$(dirname "$XRAYC_DROPIN")"
+    cat <<UNIT > "$XRAYC_DROPIN"
+# fixerror-node: geo-базы — общие с нодой ($GEODATA_DIR, обновляет geo-update)
+[Service]
+Environment=XRAY_LOCATION_ASSET=$GEODATA_DIR
+UNIT
+    cat <<UNIT > "$XRAYC_SUB_UNIT"
+[Unit]
+Description=Конфиг xray-клиента из подписки FixErrorVPN (Автовыбор)
+Wants=network-online.target
+After=network-online.target xray.service
+
+[Service]
+Type=oneshot
+ExecStart=$XRAYC_UPDATER
+UNIT
+    cat <<'UNIT' > "$XRAYC_SUB_TIMER"
+[Unit]
+Description=Обновление конфига xray-клиента из подписки раз в 6 часов
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=6h
+RandomizedDelaySec=20min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+    return 0
+}
+
+# Скрипт обновления. Пути вписываются при установке; переменные окружения
+# XSUB_* их подменяют — так скрипт проверяется тестами без сервера.
+xrayc_write_updater() {
+    {
+        cat <<HEAD
+#!/bin/bash
+# xray-sub-update — конфиг xray-клиента ноды из подписки FixErrorVPN («Автовыбор»).
+# Новый конфиг ставится, только если прошёл xray -test и через него открылся
+# Telegram; иначе возвращается прежний. Ссылка подписки — в URL_FILE (600).
+set -u
+URL_FILE=\${XSUB_URL_FILE:-$XRAYC_SUB_FILE}
+CFG=\${XSUB_CFG:-$XRAYC_CFG}
+XRAY=\${XSUB_XRAY:-$XRAYC_BIN}
+ASSET=\${XSUB_ASSET:-$GEODATA_DIR}
+STATE=\${XSUB_STATE:-/var/lib/xray-sub}
+NOTIFY=\${XSUB_NOTIFY:-$NOTIFY_BIN}
+PROXY=$XRAYC_PROXY
+HEAD
+        cat <<'BODY'
+PREV=$CFG.prev
+mkdir -p "$STATE"
+log(){ echo "$*"; logger -t xray-sub "$*" 2>/dev/null || true; }
+# Ошибка: в журнал всегда, в Telegram — не чаще раза в сутки
+fail(){
+    log "ОШИБКА: $*"
+    if [ -z "$(find "$STATE/notified" -mmin -1440 2>/dev/null)" ] && [ -x "$NOTIFY" ]; then
+        "$NOTIFY" "⚠️ <b>xray-клиент: не обновился конфиг из подписки</b>: $*" >/dev/null 2>&1 && touch "$STATE/notified"
+    fi
+    exit 1
+}
+[ -s "$URL_FILE" ] || fail "нет ссылки подписки ($URL_FILE)"
+URL=$(tr -d ' \r\n' < "$URL_FILE")
+VER=$("$XRAY" version 2>/dev/null | awk 'NR==1{print $2}')
+HWID="srv-$(sha256sum /etc/machine-id 2>/dev/null | cut -c1-16)"
+T=$(mktemp -d /var/tmp/xsub.XXXXXX); trap 'rm -rf "$T"' EXIT
+
+# Правило ответов «FixErrorVPN Xray» отдаёт Xray JSON по такому User-Agent
+get(){ curl -fsS -m 40 "$@" -o "$T/sub.json" \
+        -H "User-Agent: FixErrorVPN-server Xray-core/${VER:-0}" -H "x-hwid: $HWID" \
+        -H "x-device-os: Linux" -H "x-device-model: $(hostname -s)" "$URL"; }
+# Сначала напрямую, при неудаче — через сам клиент
+get 2>/dev/null || get -x "$PROXY" 2>/dev/null || fail "подписка не скачалась"
+
+python3 - "$T/sub.json" "$T/new.json" <<'PY' || fail "в подписке нет конфига «Автовыбор» (балансировщик Default_Balancer)"
+import json, sys
+d = json.load(open(sys.argv[1]))
+items = d if isinstance(d, list) else [d]
+pick = next((c for c in items if isinstance(c, dict) and any(b.get('tag') == 'Default_Balancer'
+             for b in c.get('routing', {}).get('balancers', []))), None)
+if not pick or sum(1 for o in pick.get('outbounds', []) if str(o.get('tag', '')).startswith('proxy')) < 2:
+    sys.exit(1)
+pick.pop('remarks', None)
+# Входы — только наши порты и только localhost, что бы ни пришло
+pick['inbounds'] = [i for i in pick.get('inbounds', []) if i.get('port') in (10808, 10809)]
+for i in pick['inbounds']:
+    i['listen'] = '127.0.0.1'
+if len(pick['inbounds']) != 2:
+    sys.exit(1)
+json.dump(pick, open(sys.argv[2], 'w'), indent=2, ensure_ascii=False)
+PY
+
+if cmp -s "$T/new.json" "$CFG"; then log "без изменений"; rm -f "$STATE/notified"; exit 0; fi
+XRAY_LOCATION_ASSET=$ASSET "$XRAY" run -test -config "$T/new.json" >"$T/test.log" 2>&1 \
+    || fail "новый конфиг не прошёл xray -test: $(tail -1 "$T/test.log")"
+
+had_prev=0
+[ -f "$CFG" ] && cp -a "$CFG" "$PREV" && had_prev=1
+mkdir -p "$(dirname "$CFG")"
+install -m 644 "$T/new.json" "$CFG"
+systemctl restart xray
+ok=0
+for n in 1 2 3 4 5 6; do
+    sleep "${XSUB_WAIT:-5}"
+    code=$(curl -s -o /dev/null -m 10 -w '%{http_code}' -x "$PROXY" https://api.telegram.org || true)
+    [ -n "$code" ] && [ "$code" != "000" ] && { ok=1; break; }
+done
+if [ $ok = 1 ]; then
+    n=$(python3 -c "import json,sys;print(sum(1 for o in json.load(open(sys.argv[1]))['outbounds'] if str(o.get('tag','')).startswith('proxy')))" "$CFG")
+    log "конфиг обновлён из подписки: серверов $n, Telegram через клиент открывается"
+    rm -f "$STATE/notified"
+    exit 0
+fi
+if [ $had_prev = 1 ]; then
+    cp -a "$PREV" "$CFG"; systemctl restart xray
+    fail "через новый конфиг не открылся Telegram — вернул прежний"
+fi
+mv -f "$CFG" "$CFG.bad"; systemctl stop xray
+fail "через конфиг из подписки не открылся Telegram (прежнего конфига не было)"
+BODY
+    } > "$XRAYC_UPDATER"
+    chmod 755 "$XRAYC_UPDATER"
+    return 0
+}
+
+xrayc_write_url() {
+    mkdir -p "$(dirname "$XRAYC_SUB_FILE")"
+    ( umask 077; printf '%s\n' "$XRAY_SUB_URL" > "$XRAYC_SUB_FILE" )
+    chmod 600 "$XRAYC_SUB_FILE"
+    return 0
+}
+
+comp_xray_client() {
+    echo ">>> Свой xray-клиент для Telegram (конфиг из подписки FixErrorVPN)..."
+    ask_xray_sub || return 1
+    [[ -d "$GEODATA_DIR" ]] || echo "  [ВНИМАНИЕ] нет $GEODATA_DIR — без geo-баз конфиг не пройдёт проверку (пункт 2 -> 25)"
+    xrayc_install_bin || return 1
+    xrayc_write_url
+    xrayc_write_updater
+    xrayc_write_units
+    systemctl daemon-reload >>"$SETUP_LOG" 2>&1
+    if ! "$XRAYC_UPDATER"; then
+        echo "  [СБОЙ] конфиг из подписки не встал (журнал: journalctl -t xray-sub)"
+        return 1
+    fi
+    systemctl enable xray.service >>"$SETUP_LOG" 2>&1 || true
+    systemctl enable --now xray-sub-update.timer >>"$SETUP_LOG" 2>&1 || true
+    if ! ss -H -ltn 2>/dev/null | awk '{print $4}' | grep -qx '127.0.0.1:10808'; then
+        echo "  [СБОЙ] xray не слушает 127.0.0.1:10808"
+        return 1
+    fi
+    echo "  Слушает 127.0.0.1:10808 (socks) и 10809 (http); для Telegram: TG_PROXY=$XRAYC_PROXY"
+    echo "  Обновление конфига: раз в 6 часов (xray-sub-update.timer), журнал: journalctl -t xray-sub"
+    return 0
+}
+
+comp_xray_client_menu() { INSTALL_XRAY_CLIENT="y"; comp_xray_client || return 1; save_state; return 0; }
+
 # ===== lib/70-web.sh ===================================================
 # ##########################################################################
 #  ВЕБ
@@ -3797,7 +4095,8 @@ full_install() {
             PANEL_IP=""; PANEL_HOSTKEY=""; REMNA_SECRET=""; SERVER_LABEL=""
             NODE_ROLE=""; CDN_DOMAIN=""; ROLE_ASKED=""
             SSH_PUBLIC_KEY=""; SSH_EXTRA_KEYS=""; INSTALL_WARP=""; INSTALL_SPEEDTEST=""
-            AGENT_SSH_KEYS=""; GEODATA=""; RKN_BLOCK=""; INSTALL_WARP_NATIVE=""; INSTALL_PSIPHON=""; PSIPHON_REGION=""
+            AGENT_SSH_KEYS=""; GEODATA=""; RKN_BLOCK=""; RKN_ALLOW=""; INSTALL_WARP_NATIVE=""; INSTALL_PSIPHON=""; PSIPHON_REGION=""
+            INSTALL_XRAY_CLIENT=""; XRAY_SUB_URL=""
             REMNANODE_VERSION=""
             SSH_PORT="8422"; ADMIN_USER="vadim"
             SETUP_TG=""; TG_BOT_TOKEN=""; TG_CHAT_ID=""; TG_TOPIC_ID=""; TG_PROXY=""
@@ -3834,19 +4133,35 @@ full_install() {
             read -ep "Страна выхода Psiphon, две буквы (Enter — страна сервера): " PSIPHON_REGION
             PSIPHON_REGION=$(echo "$PSIPHON_REGION" | tr -d '[:space:]' | tr 'a-z' 'A-Z')
         fi
+        [[ -z "$INSTALL_XRAY_CLIENT" ]] && read -ep "Свой xray-клиент для Telegram (нужен нодам в РФ, конфиг из подписки)? [y/N]: " INSTALL_XRAY_CLIENT
+        [[ -z "$INSTALL_XRAY_CLIENT" ]] && INSTALL_XRAY_CLIENT="n"
         [[ -z "$INSTALL_SPEEDTEST" ]] && read -ep "Speedtest CLI? [Y/n]: " INSTALL_SPEEDTEST
         [[ -z "$INSTALL_SPEEDTEST" ]] && INSTALL_SPEEDTEST="y"
         [[ -z "$GEODATA" ]]           && read -ep "Geo-базы Loyalsoldier с обновлением раз в 3 дня? [Y/n]: " GEODATA
         [[ -z "$GEODATA" ]] && GEODATA="y"
         [[ -z "${RKN_BLOCK:-}" ]]     && read -ep "Не пускать проберов РКН и сканеры (ipset, обновление раз в сутки)? [Y/n]: " RKN_BLOCK
         [[ -z "${RKN_BLOCK:-}" ]] && RKN_BLOCK="y"
+        ask_cdn_allow
+        if xrayc_wanted; then
+            ui_section "Свой xray-клиент для Telegram"
+            ask_xray_sub || return 1
+            [[ -z "${TG_PROXY:-}" ]] && TG_PROXY="$XRAYC_PROXY"
+        fi
 
-        ui_section "Telegram-уведомления"
-        [[ -z "$SETUP_TG" && -z "$TG_BOT_TOKEN" ]] && read -ep "Настроить Telegram-уведомления? [Y/n]: " SETUP_TG
-        [[ -z "$SETUP_TG" && -z "$TG_BOT_TOKEN" ]] && SETUP_TG="y"
-        [[ "$SETUP_TG" =~ ^[Yy]$ || -n "$TG_BOT_TOKEN" ]] && ask_telegram
+        ui_section "Telegram-уведомления (обязательно)"
+        ask_telegram
     fi
-    [[ "$SETUP_TG" =~ ^[Yy]$ || -n "$TG_BOT_TOKEN" ]] && TG_ON=1 || TG_ON=""
+    # Без файла ответов ask_* выше уже спросили; с ним — те же значения по умолчанию
+    [[ -n "$NONINTERACTIVE" ]] && ask_cdn_allow
+    # С xray-клиентом Telegram по умолчанию идёт через него, а geo-базы нужны
+    # его конфигу (он берёт базы ноды)
+    if xrayc_wanted; then
+        [[ -z "${TG_PROXY:-}" ]] && TG_PROXY="$XRAYC_PROXY"
+        GEODATA="y"
+    fi
+    # Уведомления не пропускаются: шаг всегда в списке, и без токена он честно
+    # падает в сводке, а не тихо значится «пропущен»
+    SETUP_TG="y"
 
     save_state   # запомнить ответы для будущих обновлений
     get_server_ip || true
@@ -3901,10 +4216,13 @@ full_install() {
     [[ "$INSTALL_WARP" =~ ^[Yy]$ ]] && do_step "Cloudflare WARP" comp_warp || skip_step "Cloudflare WARP"
     [[ "${INSTALL_WARP_NATIVE:-n}" =~ ^[Yy]$ ]] && do_step "warp-native" comp_warp_native || skip_step "warp-native"
     [[ "${INSTALL_PSIPHON:-n}" =~ ^[Yy]$ ]] && do_step "Psiphon" comp_psiphon || skip_step "Psiphon"
-    # Telegram — до ноды: тогда сторож и плановые перезапуски работают с самого начала
-    [[ -n "$TG_ON" ]] && do_step "Telegram-уведомления" comp_telegram || skip_step "Telegram-уведомления"
-    # Базы — до ноды: тогда compose сразу пишется с томами
+    # Базы — до ноды: тогда compose сразу пишется с томами. И до xray-клиента:
+    # его конфиг ссылается на те же geo-базы
     [[ "${GEODATA:-y}" =~ ^[Yy]$ ]] && do_step "Geo-базы (Loyalsoldier)" comp_geodata || skip_step "Geo-базы (Loyalsoldier)"
+    # xray-клиент — до Telegram: на нодах в РФ уведомления идут только через него
+    xrayc_wanted && do_step "xray-клиент для Telegram" comp_xray_client || skip_step "xray-клиент для Telegram"
+    # Telegram — до ноды: тогда сторож и плановые перезапуски работают с самого начала
+    do_step "Telegram-уведомления" comp_telegram
     do_step "Нода Remnanode" comp_node
     do_step "Сайт ноды в nginx" comp_web_site
     do_step "node-pull (сертификат и сайт с панели)" comp_node_pull
@@ -3920,7 +4238,9 @@ full_install() {
 
     if [[ -z "$NONINTERACTIVE" ]]; then
         echo
-        ui_info "отчёт сохранён в $REPORT_FILE, там же пароль учётки и строка для панели"
+        ui_info "отчёт сохранён в $REPORT_FILE, там же строка для панели"
+        [[ "$ADMIN_PASS_SOURCE" == "generated" ]] && \
+            ui_warn "пароль учётки показан выше один раз: ни в отчёт, ни в журнал он не записан"
         if [[ -n "${NODE_PULL_PENDING:-}" ]]; then
             ui_warn "не забудьте добавить строку node-pull на панели (она выше, в отчёте)"
         fi
@@ -4847,8 +5167,39 @@ rh_check() {
             rhc_bad "панель НЕ подключена к этой ноде прямо сейчас"
         fi
     else
-        rhc_warn "Telegram-уведомления не настроены — о падении ноды никто не сообщит"
+        # Уведомления обязательны: нода без них уже однажды прожила незамеченной
+        rhc_bad "Telegram-уведомления не настроены — о падении ноды никто не сообщит"
         rhc_fix "уведомления: меню, пункт 2 -> 11"
+    fi
+
+    # Свой xray-клиент — если он стоит (ноды в РФ: через него идут уведомления)
+    if [[ -s "$XRAYC_SUB_FILE" ]]; then
+        local rhc_xl rhc_xlast
+        if ! systemctl is-active --quiet xray.service 2>/dev/null; then
+            rhc_bad "xray-клиент не работает — уведомления из РФ не дойдут"
+            rhc_fix "xray-клиент: меню, пункт 2 -> 29"
+        else
+            rhc_xl=$(ss -H -ltn 2>/dev/null | awk '{print $4}' | grep -E ':1080[89]$' | sort | paste -sd' ' -)
+            if [[ "$rhc_xl" == "127.0.0.1:10808 127.0.0.1:10809" ]]; then
+                rhc_ok "xray-клиент работает, слушает только 127.0.0.1:10808/10809"
+            else
+                rhc_bad "xray-клиент слушает не только localhost: ${rhc_xl:-ничего}"
+                rhc_fix "xray-клиент: меню, пункт 2 -> 29"
+            fi
+            [[ "$(rhc_perm "$XRAYC_SUB_FILE")" == "600" ]] \
+                || rhc_bad "$(basename "$XRAYC_SUB_FILE") с правами $(rhc_perm "$XRAYC_SUB_FILE") — ссылку подписки читает любой"
+            if systemctl is-enabled --quiet xray-sub-update.timer 2>/dev/null; then
+                rhc_xlast=$(journalctl -t xray-sub -n 1 --no-pager -o cat 2>/dev/null | tail -1)
+                if [[ "$rhc_xlast" == ОШИБКА* ]]; then
+                    rhc_warn "конфиг из подписки не обновился: ${rhc_xlast#ОШИБКА: }"
+                else
+                    rhc_ok "конфиг клиента обновляется из подписки (xray-sub-update.timer)"
+                fi
+            else
+                rhc_warn "таймер xray-sub-update выключен — конфиг клиента устареет"
+                rhc_fix "xray-клиент: меню, пункт 2 -> 29"
+            fi
+        fi
     fi
 
     # ----------------------------------------------------------------------
@@ -5017,6 +5368,7 @@ components_menu() {
         echo "25) Geo-базы Loyalsoldier + обновление раз в 3 дня"
         echo "26) warp-native (WARP интерфейсом)  27) Psiphon (SOCKS5)"
         echo "28) Защита от проберов РКН (ipset, обновление раз в сутки)"
+        echo "29) xray-клиент для Telegram (ноды в РФ, конфиг из подписки)"
         echo "14) Защита диска          15) Обновить ноду  16) Статус ноды"
         echo "20) Обновить систему (apt upgrade + перезагрузка)"
         echo "--- Диагностика ---"
@@ -5051,6 +5403,7 @@ components_menu() {
             26) menu_step "warp-native"           comp_warp_native_menu ;;
             27) menu_step "Psiphon"               comp_psiphon_menu ;;
             28) menu_step "Защита от проберов РКН" comp_rkn_block_menu ;;
+            29) menu_step "xray-клиент для Telegram" comp_xray_client_menu ;;
              0) return ;;
              *) echo "Нет такого пункта." ;;
         esac

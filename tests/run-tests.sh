@@ -1466,6 +1466,89 @@ OUT=$(rkrun "a.list" --restore); RC=$?
 rm -rf "$RK"
 
 # --------------------------------------------------------------------------
+head_ "34. Свой xray-клиент, уведомления, пароль, CDN"
+# --------------------------------------------------------------------------
+XC=$(mktemp -d); mkdir -p "$XC/bin" "$XC/state"
+# Подписка: обычный конфиг и «Автовыбор»; во втором — лишний вход и входы на 0.0.0.0
+cat > "$XC/sub.json" <<'JSON'
+[{"remarks":"Польша","outbounds":[{"tag":"proxy"},{"tag":"direct"}],"inbounds":[{"port":10808,"listen":"127.0.0.1"},{"port":10809,"listen":"127.0.0.1"}]},
+ {"remarks":"Автовыбор","routing":{"balancers":[{"tag":"Default_Balancer","selector":["proxy"]}]},
+  "outbounds":[{"tag":"proxy"},{"tag":"proxy-2"},{"tag":"proxy-3"},{"tag":"direct"}],
+  "inbounds":[{"tag":"socks","port":10808,"listen":"0.0.0.0"},{"tag":"http","port":10809,"listen":"0.0.0.0"},{"tag":"x","port":1234,"listen":"0.0.0.0"}]}]
+JSON
+printf '[{"remarks":"Польша","outbounds":[{"tag":"proxy"}],"inbounds":[]}]' > "$XC/sub-nobal.json"
+cat > "$XC/bin/curl" <<'FAKE'
+#!/bin/bash
+out=""; w=0
+while [[ $# -gt 0 ]]; do case "$1" in -o) out="$2"; shift;; -w) w=1; shift;; esac; shift; done
+[[ -n "$out" && "$out" != /dev/null ]] && { cp "$XC_SUB" "$out"; exit 0; }
+[[ $w == 1 ]] && { printf '%s' "${XC_TG:-302}"; exit 0; }
+exit 0
+FAKE
+cat > "$XC/bin/xray" <<'FAKE'
+#!/bin/bash
+[[ "$1" == version ]] && { echo "Xray 26.11.9 (Xray, Penetrates Everything.)"; exit 0; }
+[[ "$1" == run && "$2" == -test ]] && exit "${XC_XTEST:-0}"
+exit 0
+FAKE
+printf '#!/bin/bash\necho "systemctl $*" >> "$XC_LOG"\n' > "$XC/bin/systemctl"
+printf '#!/bin/bash\nexit 0\n' > "$XC/bin/logger"
+chmod +x "$XC/bin/"*
+echo "https://sub.example/abc" > "$XC/url"
+RH_LIB_ONLY=1 bash -c 'source "'"$ROOT"'/setup.sh"; XRAYC_UPDATER="'"$XC"'/upd"; xrayc_write_updater' >/dev/null 2>&1
+bash -n "$XC/upd" 2>/dev/null && ok "скрипт обновления xray-клиента собирается без ошибок синтаксиса" || bad "xray-sub-update с ошибкой синтаксиса"
+xcrun() { env PATH="$XC/bin:$PATH" XC_LOG="$XC/sys.log" XC_SUB="${XC_SUB_FILE:-$XC/sub.json}" XSUB_URL_FILE="$XC/url" \
+              XSUB_CFG="$XC/config.json" XSUB_XRAY="$XC/bin/xray" XSUB_STATE="$XC/state" XSUB_NOTIFY=/nonexistent \
+              XSUB_WAIT=0 bash "$XC/upd" 2>&1; }
+OUT=$(xcrun); RC=$?
+CHK=$("$PY" -c '
+import json,sys; c=json.load(open(sys.argv[1]))
+print(any(b["tag"]=="Default_Balancer" for b in c["routing"]["balancers"]), sorted((i["port"],i["listen"]) for i in c["inbounds"]), "remarks" in c)' "$XC/config.json" 2>&1)
+if [[ $RC == 0 && "$CHK" == "True [(10808, '127.0.0.1'), (10809, '127.0.0.1')] False" ]] && grep -q 'серверов 3' <<< "$OUT"; then
+    ok "из подписки берётся «Автовыбор»; входы — только 10808/10809 и только 127.0.0.1"
+else bad "xray-sub-update: код $RC, $CHK, $OUT"; fi
+OUT=$(xcrun); [[ $? == 0 ]] && grep -q 'без изменений' <<< "$OUT" && ok "тот же конфиг — без перезапуска xray" || bad "повторный запуск: $OUT"
+cp "$XC/config.json" "$XC/good.json"
+OUT=$(XC_SUB_FILE="$XC/sub-nobal.json" xcrun); RC=$?
+[[ $RC != 0 ]] && grep -q 'нет конфига «Автовыбор»' <<< "$OUT" && cmp -s "$XC/config.json" "$XC/good.json" \
+    && ok "подписка без «Автовыбора» не трогает рабочий конфиг" || bad "подписка без балансировщика: код $RC, $OUT"
+sed -i 's/"proxy-3"/"proxy-9"/' "$XC/sub.json"
+OUT=$(XC_TG=000 xcrun); RC=$?
+[[ $RC != 0 ]] && grep -q 'вернул прежний' <<< "$OUT" && cmp -s "$XC/config.json" "$XC/good.json" \
+    && ok "через новый конфиг не открылся Telegram — возвращается прежний" || bad "откат: код $RC, $OUT"
+OUT=$(XC_XTEST=1 xcrun); RC=$?
+[[ $RC != 0 ]] && grep -q 'не прошёл xray -test' <<< "$OUT" && cmp -s "$XC/config.json" "$XC/good.json" \
+    && ok "конфиг, не прошедший xray -test, не ставится" || bad "xray -test: код $RC, $OUT"
+rm -rf "$XC"
+
+R=$(RH_LIB_ONLY=1 bash -c 'source "'"$ROOT"'/setup.sh"; NONINTERACTIVE=1; XRAY_SUB_URL=""; ask_xray_sub || echo "rc=1"' 2>&1)
+grep -q 'XRAY_SUB_URL в конфиге не задан' <<< "$R" && grep -q 'rc=1' <<< "$R" \
+    && ok "без ссылки подписки в файле ответов xray-клиент не ставится вслепую" || bad "ask_xray_sub без ссылки: $R"
+
+CA=$(RH_LIB_ONLY=1 bash -c 'source "'"$ROOT"'/setup.sh"; NONINTERACTIVE=1; RKN_BLOCK=y
+    NODE_ROLE=cdn; RKN_ALLOW="10.1.1.1"; ask_cdn_allow; ask_cdn_allow; echo "cdn=[$RKN_ALLOW]"
+    NODE_ROLE=reality; RKN_ALLOW=""; ask_cdn_allow; echo "reality=[$RKN_ALLOW]"
+    NODE_ROLE=cdn; RKN_BLOCK=n; RKN_ALLOW=""; ask_cdn_allow; echo "off=[$RKN_ALLOW]"' 2>&1)
+if grep -qx "cdn=\[10.1.1.1 $(grep -m1 '^CDN_RKN_ALLOW_DEFAULT=' lib/00-header.sh | cut -d'"' -f2)\]" <<< "$CA" \
+   && grep -qx 'reality=\[\]' <<< "$CA" && grep -qx 'off=\[\]' <<< "$CA"; then
+    ok "CDN-нода: сети CDN-провайдера добавляются в исключения один раз, на остальных — нет"
+else bad "исключения CDN: $CA"; fi
+
+if ! grep -q 'Настроить Telegram-уведомления' setup.sh && grep -q 'do_step "Telegram-уведомления" comp_telegram$' setup.sh \
+   && ! grep -q 'skip_step "Telegram-уведомления"' setup.sh; then
+    ok "Telegram-уведомления нельзя пропустить при установке"
+else bad "шаг Telegram-уведомлений всё ещё можно пропустить"; fi
+grep -q 'rhc_bad "Telegram-уведомления не настроены' check.sh \
+    && ok "диагностика считает отсутствие уведомлений ошибкой" || bad "диагностика: нет уведомлений — не ошибка"
+
+# Пароль: ни в журнал (вывод шага comp_user), ни в файл отчёта
+REPBLK=$(awk '/^    out=\$\($/,/^    \)$/' lib/10-helpers.sh)
+if [[ -n "$REPBLK" ]] && ! grep -qE '\$\{?ADMIN_PASS([^_]|$)' <<< "$REPBLK" \
+   && ! awk '/^comp_user\(\)/,/^}/' lib/50-security.sh | grep -E '^\s*echo' | grep -v chpasswd | grep -qE '\$\{?ADMIN_PASS([^_]|$)'; then
+    ok "сгенерированный пароль не пишется ни в отчёт, ни в журнал установки"
+else bad "пароль учётки всё ещё попадает в отчёт или журнал"; fi
+
+# --------------------------------------------------------------------------
 head_ "30. shellcheck (если установлен)"
 # --------------------------------------------------------------------------
 if command -v shellcheck >/dev/null 2>&1; then

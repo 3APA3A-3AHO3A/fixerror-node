@@ -19,8 +19,10 @@ comp_user() {
             ADMIN_PASS=$(openssl rand -base64 18); ADMIN_PASS_SOURCE="generated"
         fi
         echo "$ADMIN_USER:$ADMIN_PASS" | chpasswd
+        # Сам пароль сюда не печатаем: вывод шага целиком уходит в журнал
+        # установки. Он показывается один раз — в итоге на экране.
         [[ "$ADMIN_PASS_SOURCE" == "generated" ]] && \
-            echo "!!! ПАРОЛЬ $ADMIN_USER@$(hostname): $ADMIN_PASS  (повторю в итоговом отчёте)"
+            echo "  Пароль $ADMIN_USER сгенерирован — покажу один раз в итоге на экране."
     else
         # Согласие на смену пароля уже получено в ask_admin_password
         if [[ "$ADMIN_PASS_SOURCE" == "manual" && -n "$ADMIN_PASS" ]]; then

@@ -344,8 +344,11 @@ ask_ssh_params() {
 # и вызов "[[ ... ]] && ask_telegram" убивал бы весь скрипт из-за set -e.
 ask_telegram() {
     [[ -n "$TG_ASKED" || -n "$NONINTERACTIVE" ]] && return 0
-    [[ -z "$TG_BOT_TOKEN" ]] && read -ep "Telegram BOT_TOKEN: " TG_BOT_TOKEN
-    [[ -z "$TG_CHAT_ID" ]]   && read -ep "Telegram CHAT_ID (супергруппа: начинается с -100): " TG_CHAT_ID
+    # Уведомления обязательны: без них о падении ноды никто не узнает. Пропустить
+    # вопрос нельзя — так нода однажды и осталась без уведомлений.
+    # Ввода нет (конец stdin) — выходим, а не крутимся в цикле вечно
+    while [[ -z "$TG_BOT_TOKEN" ]]; do read -ep "Telegram BOT_TOKEN: " TG_BOT_TOKEN || return 0; done
+    while [[ -z "$TG_CHAT_ID" ]];   do read -ep "Telegram CHAT_ID (супергруппа: начинается с -100): " TG_CHAT_ID || return 0; done
     [[ -z "$TG_TOPIC_ID" ]]  && read -ep "Topic ID темы супергруппы (Enter — если без топиков): " TG_TOPIC_ID
     # Прокси нужен, если сервер не достаёт api.telegram.org напрямую (ноды в РФ).
     # Спрашиваем здесь, а не в момент установки: все вопросы должны быть заданы заранее.
@@ -355,5 +358,35 @@ ask_telegram() {
         read -ep "Прокси для Telegram: " TG_PROXY
     fi
     TG_ASKED=1
+    return 0
+}
+
+# Ссылка подписки FixErrorVPN для xray-клиента (ключ сервисного пользователя,
+# например MONITORING). Проверяется только вид: https://…
+ask_xray_sub() {
+    XRAY_SUB_URL=$(printf '%s' "${XRAY_SUB_URL:-}" | tr -d '[:space:]')
+    while [[ ! "$XRAY_SUB_URL" =~ ^https://[^/]+/.+ ]]; do
+        [[ -n "$NONINTERACTIVE" ]] && { echo "  [СБОЙ] XRAY_SUB_URL в конфиге не задан или некорректен"; return 1; }
+        echo "  Ссылка подписки FixErrorVPN сервисного пользователя (например, MONITORING):"
+        read -ep "  https://…: " XRAY_SUB_URL || return 1
+        XRAY_SUB_URL=$(printf '%s' "$XRAY_SUB_URL" | tr -d '[:space:]')
+    done
+    return 0
+}
+
+# CDN-нода: сети CDN-провайдера — в исключения защиты от проберов.
+# «-» — не добавлять ничего.
+ask_cdn_allow() {
+    [[ "${NODE_ROLE:-reality}" == "cdn" ]] && rkn_block_enabled || return 0
+    [[ " ${RKN_ALLOW:-} " == *" $CDN_RKN_ALLOW_DEFAULT "* ]] && return 0
+    local a=""
+    if [[ -z "$NONINTERACTIVE" && -z "${CDN_ALLOW_ASKED:-}" ]]; then
+        read -ep "Сети CDN-провайдера, которые защита от проберов не тронет (Enter — $CDN_RKN_ALLOW_DEFAULT, «-» — никакие): " a || a=""
+    fi
+    CDN_ALLOW_ASKED=1
+    a=$(printf '%s' "$a" | tr -s '[:space:],' ' ' | sed 's/^ //; s/ $//')
+    [[ "$a" == "-" ]] && return 0
+    [[ -z "$a" ]] && a="$CDN_RKN_ALLOW_DEFAULT"
+    RKN_ALLOW=$(printf '%s %s' "${RKN_ALLOW:-}" "$a" | sed 's/^ //')
     return 0
 }

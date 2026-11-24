@@ -626,8 +626,39 @@ rh_check() {
             rhc_bad "панель НЕ подключена к этой ноде прямо сейчас"
         fi
     else
-        rhc_warn "Telegram-уведомления не настроены — о падении ноды никто не сообщит"
+        # Уведомления обязательны: нода без них уже однажды прожила незамеченной
+        rhc_bad "Telegram-уведомления не настроены — о падении ноды никто не сообщит"
         rhc_fix "уведомления: меню, пункт 2 -> 11"
+    fi
+
+    # Свой xray-клиент — если он стоит (ноды в РФ: через него идут уведомления)
+    if [[ -s "$XRAYC_SUB_FILE" ]]; then
+        local rhc_xl rhc_xlast
+        if ! systemctl is-active --quiet xray.service 2>/dev/null; then
+            rhc_bad "xray-клиент не работает — уведомления из РФ не дойдут"
+            rhc_fix "xray-клиент: меню, пункт 2 -> 29"
+        else
+            rhc_xl=$(ss -H -ltn 2>/dev/null | awk '{print $4}' | grep -E ':1080[89]$' | sort | paste -sd' ' -)
+            if [[ "$rhc_xl" == "127.0.0.1:10808 127.0.0.1:10809" ]]; then
+                rhc_ok "xray-клиент работает, слушает только 127.0.0.1:10808/10809"
+            else
+                rhc_bad "xray-клиент слушает не только localhost: ${rhc_xl:-ничего}"
+                rhc_fix "xray-клиент: меню, пункт 2 -> 29"
+            fi
+            [[ "$(rhc_perm "$XRAYC_SUB_FILE")" == "600" ]] \
+                || rhc_bad "$(basename "$XRAYC_SUB_FILE") с правами $(rhc_perm "$XRAYC_SUB_FILE") — ссылку подписки читает любой"
+            if systemctl is-enabled --quiet xray-sub-update.timer 2>/dev/null; then
+                rhc_xlast=$(journalctl -t xray-sub -n 1 --no-pager -o cat 2>/dev/null | tail -1)
+                if [[ "$rhc_xlast" == ОШИБКА* ]]; then
+                    rhc_warn "конфиг из подписки не обновился: ${rhc_xlast#ОШИБКА: }"
+                else
+                    rhc_ok "конфиг клиента обновляется из подписки (xray-sub-update.timer)"
+                fi
+            else
+                rhc_warn "таймер xray-sub-update выключен — конфиг клиента устареет"
+                rhc_fix "xray-клиент: меню, пункт 2 -> 29"
+            fi
+        fi
     fi
 
     # ----------------------------------------------------------------------

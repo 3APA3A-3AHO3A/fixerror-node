@@ -180,7 +180,7 @@ print_summary() {
         case "$ADMIN_PASS_SOURCE" in
             manual) echo "Пароль учётки:   задан вами вручную" ;;
             kept)   echo "Пароль учётки:   не менялся" ;;
-            *)      echo "Пароль учётки:   ${ADMIN_PASS:-—}" ;;
+            *)      echo "Пароль учётки:   сгенерирован, показан один раз на экране (в файлы не пишется)" ;;
         esac
         echo "Нода:            ${SERVER_LABEL:-—} (${NODE_ROLE:-reality})"
         echo "IP сервера:      ${SERVER_IP:-—}"
