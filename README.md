@@ -5,6 +5,7 @@
 Установщик ноды Remnawave для FixErrorVPN. Ставит ноду по общему образцу всех нод сервиса:
 - учётка и харденинг SSH, отдельная учётка для ИИ-агентов;
 - фаервол с блокировкой торрентов, fail2ban;
+- защита от проберов РКН: новые входящие из госсетей и сетей сканеров отбрасываются, списки обновляются раз в сутки;
 - общий шаблон sysctl, замер и закрепление MTU, время UTC;
 - Docker и контейнер ноды с geo-базами Loyalsoldier, базы обновляются раз в 3 дня;
 - выходы для Xray: WARP на порту 6000, warp-native, Psiphon;
@@ -47,7 +48,7 @@ sudo bash /tmp/setup.sh /root/node.conf
 | Учётка, пароль, порт SSH | vadim, случайный, 8422 |
 | Публичный ключ SSH и дополнительные ключи | — |
 | Ключ ИИ-агента | Enter — без агента |
-| WARP, warp-native, Psiphon, Speedtest, geo-базы | по умолчанию — да |
+| WARP, warp-native, Psiphon, Speedtest, geo-базы, защита от проберов РКН | по умолчанию — да |
 | Telegram: токен, чат, топик, прокси | ноды в РФ: `socks5h://127.0.0.1:10808` |
 
 ## После установки: ключ ноды на панели
@@ -98,6 +99,7 @@ sudo bash /tmp/setup.sh --repair    # починка без вопросов
 24) Учётка ИИ-агента
 25) Geo-базы Loyalsoldier + обновление раз в 3 дня
 26) warp-native           27) Psiphon
+28) Защита от проберов РКН (ipset, обновление раз в сутки)
 14) Защита диска          15) Обновить ноду  16) Статус ноды
 20) Обновить систему (apt upgrade + перезагрузка)
 17) bench.sh   18) ipregion   19) censorcheck
@@ -124,6 +126,7 @@ sudo bash /tmp/setup.sh --repair    # починка без вопросов
 | SSH | `/etc/ssh/sshd_config.d/00-hardening.conf`: порт 8422, root и пароли закрыты. Port пишется, только если его нет в основном `sshd_config`: два одинаковых Port дают «Address already in use» |
 | UFW | 8422/tcp (limit), 80/tcp, 443/tcp, 443/udp; 2222/tcp только с IP панели; + `UFW_EXTRA_PORTS` |
 | Торренты | 6 правил `-m string` в `/etc/ufw/before.rules`, до ESTABLISHED |
+| Проберы РКН | подробно — ниже |
 | fail2ban | sshd: 4 попытки → бан на 24 часа; recidive: бан на неделю |
 | sysctl | `/etc/sysctl.d/99-vpn-tune.conf`: BBR/fq, буферы 16 МБ, conntrack 262144, резерв портов 8422, 2222, 9443, 6000, IPv6 выключен |
 | MTU | путь замеряется пингом без фрагментации; если меньше 1500 — служба `mtu-<интерфейс>` и тот же MTU в `daemon.json` |
@@ -134,6 +137,16 @@ sudo bash /tmp/setup.sh --repair    # починка без вопросов
 | node-pull | `/usr/local/sbin/node-pull`, ключи в `/etc/node-pull`, `node-pull.timer` |
 | Уведомления | `/usr/local/sbin/remnawave-notify` (тот же скрипт, что на панели), `/etc/remnawave-notify.env`, `remnawave-notify-watch.service`, `@reboot`, PAM |
 | Время | UTC, chrony |
+
+### Защита от проберов РКН
+
+Проберы ТСПУ и сканеры подключаются к ноде как клиенты и по ответу узнают VPN. Нода им не отвечает: входящие соединения из госсетей и сетей сканеров отбрасываются. Сети берутся из трёх списков [shadow-netlab/traffic-guard-lists](https://github.com/shadow-netlab/traffic-guard-lists): `government_networks`, `antiscanner`, `skipa` (около 2900 сетей IPv4 и 30 IPv6). Списки те же, что у rkn-guard, но без его программы и панели: только ipset и правило ufw.
+
+- Режутся только **новые** входящие соединения. Ответы на соединения, которые открыла сама нода, проходят: клиенты на нодах, где весь трафик идёт через VPN, по-прежнему открывают госсайты.
+- IP панели не блокируется никогда. Свои исключения (например, российский сервер, который пересылает трафик на ноду) — в `/etc/fixerror-node/rkn-allow.txt` по одному на строку, затем `sudo rkn-block`. При установке их можно задать в `RKN_ALLOW`.
+- Обновление: `/usr/local/sbin/rkn-block` + `rkn-block.timer`, раз в сутки в 02:30 UTC ± час. Сломанный список (меньше 500 сетей), сбой скачивания и сети шире /16 не принимаются: наборы остаются прежними, о сбое — в Telegram не чаще раза в сутки.
+- После перезагрузки наборы поднимаются из сохранённой копии до ufw (`rkn-block-restore.service`, дополнение `ufw.service.d/rkn-block.conf`). Без этого правило со ссылкой на несуществующий набор не дало бы ufw стартовать.
+- Посмотреть, что попадёт в наборы, ничего не меняя: `sudo rkn-block --print`. Выключить: меню, пункт 2 → 28 → 2.
 
 Свой xray для Telegram на нодах в РФ установщик не ставит. Если он нужен, укажите его адрес в `TG_PROXY`.
 
@@ -146,9 +159,10 @@ sudo bash /tmp/setup.sh --repair    # починка без вопросов
 | `/etc/fixerror-node/install.conf` | Сохранённые ответы для следующих запусков |
 | `/etc/remnawave-notify.env` | Токен Telegram и имя ноды |
 | `/etc/node-pull/key` | Ключ ноды для панели |
+| `/etc/fixerror-node/rkn-allow.txt` | Исключения защиты от проберов РКН |
 | `/opt/remnanode/docker-compose.yml` | Контейнер ноды, внутри SECRET_KEY |
 
-Файлы с секретами — с правами 600. Журналы служб: `journalctl -t node-pull`, `journalctl -t geo-update`.
+Файлы с секретами — с правами 600. Журналы служб: `journalctl -t node-pull`, `journalctl -t geo-update`, `journalctl -t rkn-block`.
 
 ## Разработка
 
@@ -165,6 +179,7 @@ sudo bash /tmp/setup.sh --repair    # починка без вопросов
 | `40-system.sh` | swap, пакеты, sysctl, время, MTU, диск, автообновления |
 | `45-preflight.sh` | проверки сервера, cloud-init и apt, tmux, замок |
 | `50-security.sh` | учётки, ключи сервера, SSH, UFW и торренты, fail2ban |
+| `52-rknblock.sh` | защита от проберов РКН: ipset, правило ufw, таймер |
 | `60-node.sh` | Docker и контейнер ноды |
 | `62-geodata.sh` | geo-базы и их таймер |
 | `70-web.sh` | сайт nginx и node-pull |
@@ -190,6 +205,7 @@ git push
 - строку ключа для панели;
 - что `remnawave-notify` совпадает байт в байт с эталоном `tests/remnawave-notify.ref`;
 - безопасное обновление geo-баз;
+- защиту от проберов РКН: разбор списков, исключения, отказ от сломанного списка, подъём наборов при загрузке;
 - что диагностика ничего не меняет.
 
 Если `remnawave-notify` меняется на панели, обновите и эталон, и `lib/80-notify.sh`.

@@ -111,7 +111,7 @@ repair_perms() {
 # исполняется через /bin/sh, где нет [[ ]], и молча не работает.
 repair_verify() {
     local f bad=""
-    for f in "$NOTIFY_BIN" "$GEODATA_BIN" "$NODE_PULL_BIN"; do
+    for f in "$NOTIFY_BIN" "$GEODATA_BIN" "$NODE_PULL_BIN" "$RKN_BIN"; do
         [[ -f "$f" ]] || continue
         head -1 "$f" | grep -q '^#!' || bad+=" $(basename "$f")"
     done

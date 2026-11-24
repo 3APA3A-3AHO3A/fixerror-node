@@ -1363,6 +1363,109 @@ if [[ "$R" == "3.4.3" ]]; then ok "закреплённая версия выч�
 else bad "версия из compose прочиталась как '$R'"; fi
 
 # --------------------------------------------------------------------------
+head_ "33. Защита от проберов РКН"
+# --------------------------------------------------------------------------
+RK=$(mktemp -d)
+for f in before.rules before6.rules; do
+    ch=ufw-before; [[ $f == before6.rules ]] && ch=ufw6-before
+    cat > "$RK/$f" <<RULES
+*filter
+:$ch-input - [0:0]
+# End required lines
+
+-A $ch-input -i lo -j ACCEPT
+-A $ch-input -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+COMMIT
+RULES
+done
+R=$(RH_LIB_ONLY=1 bash -c '
+    source "'"$ROOT"'/setup.sh"
+    UFW_BEFORE="'"$RK"'/before.rules"; UFW_BEFORE6="'"$RK"'/before6.rules"
+    rkn_rules_apply && rkn_rules_apply && torrent_rules_apply && echo applied
+' 2>&1)
+n4=$(grep -c -- '--match-set rkn-block src' "$RK/before.rules")
+n6=$(grep -c -- '--match-set rkn-block6 src' "$RK/before6.rules")
+if [[ "$R" == applied && "$n4" == 1 && "$n6" == 1 ]]; then ok "правило РКН: по одной строке в before.rules и before6.rules и после повторного запуска"
+else bad "правило РКН: '$R', строк IPv4 $n4, IPv6 $n6"; fi
+grep -q -- '-A ufw-before-input -m conntrack --ctstate NEW -m set --match-set rkn-block src -j DROP' "$RK/before.rules" \
+    && grep -q -- '-A ufw6-before-input -m conntrack --ctstate NEW -m set --match-set rkn-block6 src -j DROP' "$RK/before6.rules" \
+    && ok "режутся только новые входящие (ответы на исходящие проходят)" || bad "правило РКН без --ctstate NEW или не в той цепочке"
+grep -q 'BitTorrent protocol' "$RK/before.rules" && ok "правило РКН не мешает правилам против торрентов" \
+    || bad "правила против торрентов пропали после правила РКН"
+RH_LIB_ONLY=1 bash -c '
+    source "'"$ROOT"'/setup.sh"
+    UFW_BEFORE="'"$RK"'/before.rules"; UFW_BEFORE6="'"$RK"'/before6.rules"
+    rkn_rules_remove
+' >/dev/null 2>&1
+if ! grep -q 'rkn-block' "$RK/before.rules" "$RK/before6.rules" && grep -q 'BitTorrent protocol' "$RK/before.rules"; then
+    ok "выключение убирает только правило РКН"
+else bad "выключение РКН оставило правило или убрало чужое"; fi
+
+# Скрипт обновления: списки — локальные файлы, ipset — заглушка, которая пишет, что ей дали
+mkdir -p "$RK/lists" "$RK/bin"
+{ printf '# Networks announced by AS1\r\n'
+  for i in $(seq 1 300); do printf '10.%d.%d.0/24\r\n' $((i/250)) $((i%250)); done
+  echo "10.9.9.0/24# Networks announced by AS2"; echo "11.0.0.0/8"; echo "мусор"; echo; echo "2a00:1::/32"; echo "2a00::/16"
+} > "$RK/lists/a.list"
+for i in $(seq 1 300); do printf '172.%d.%d.0/24\n' $((16+i/250)) $((i%250)); done > "$RK/lists/b.list"
+echo "10.0.1.0/24" >> "$RK/lists/b.list"   # повтор из первого списка
+printf '# свои\n10.0.5.7\n' > "$RK/allow"
+cat > "$RK/bin/ipset" <<'FAKE'
+#!/bin/bash
+echo "ipset $*" >> "$RK_LOG"
+[[ "$1" == restore ]] && cat >> "$RK_LOG"
+exit 0
+FAKE
+chmod +x "$RK/bin/ipset"
+RH_LIB_ONLY=1 bash -c '
+    source "'"$ROOT"'/setup.sh"
+    RKN_BIN="'"$RK"'/rkn-block"; PANEL_IP=203.0.113.10; NOTIFY_BIN=/nonexistent
+    rkn_write_updater
+' >/dev/null 2>&1
+rkrun() { env PATH="$RK/bin:$PATH" RK_LOG="$RK/ipset.log" RKN_LISTS_URL="file://$RK/lists" RKN_LISTS="$1" \
+              RKN_SAVE="$RK/save.list" RKN_ALLOW_FILE="$RK/allow" bash "$RK/rkn-block" ${2:-} 2>&1; }
+OUT=$(rkrun "a.list b.list" --print); RC=$?
+if [[ $RC == 0 ]] && grep -qx '10.0.1.0/24' <<< "$OUT" && grep -qx '2a00:1::/32' <<< "$OUT" \
+   && grep -qx '10.9.9.0/24' <<< "$OUT" && [[ $(grep -cx '10.0.1.0/24' <<< "$OUT") == 1 ]]; then
+    ok "списки разбираются: IPv4 и IPv6, комментарии (и в конце строки) и переводы строк Windows не мешают, повторы схлопываются"
+else bad "разбор списков: код $RC, $(head -3 <<< "$OUT")"; fi
+! grep -q '11.0.0.0/8\|2a00::/16\|мусор' <<< "$OUT" && grep -q 'пропущено строк: 3' <<< "$OUT" \
+    && ok "слишком широкие сети и мусор не берутся (их видно в сообщении)" || bad "широкая сеть или мусор попали в набор"
+grep -qx '203.0.113.10 nomatch' <<< "$OUT" && grep -qx '10.0.5.7 nomatch' <<< "$OUT" \
+    && ok "IP панели и свои исключения не блокируются (nomatch)" || bad "исключений нет в наборе"
+[[ ! -e "$RK/ipset.log" && ! -e "$RK/save.list" ]] && ok "--print ничего не меняет" || bad "--print тронул ipset или файлы"
+
+OUT=$(rkrun "a.list b.list"); RC=$?
+if [[ $RC == 0 ]] && grep -q 'ipset swap rkn-block-new rkn-block$' "$RK/ipset.log" \
+   && grep -q 'ipset swap rkn-block6-new rkn-block6$' "$RK/ipset.log" \
+   && grep -qx 'add rkn-block-new 10.0.5.7 nomatch' "$RK/ipset.log" \
+   && grep -qx 'add rkn-block6-new 2a00:1::/32' "$RK/ipset.log" && [[ -s "$RK/save.list" ]]; then
+    ok "обновление: новые наборы собираются рядом и подменяются разом, копия сохраняется"
+else bad "обновление: код $RC, $OUT"; fi
+
+cp "$RK/save.list" "$RK/save.before"; : > "$RK/ipset.log"
+OUT=$(rkrun "b.list"); RC=$?
+if [[ $RC != 0 ]] && grep -q 'похоже, они сломаны' <<< "$OUT" && ! grep -q swap "$RK/ipset.log" \
+   && cmp -s "$RK/save.list" "$RK/save.before"; then
+    ok "слишком короткий список (сломан) не заменяет прежние наборы"
+else bad "короткий список: код $RC, $OUT"; fi
+OUT=$(rkrun "a.list nope.list"); RC=$?
+[[ $RC != 0 ]] && grep -q 'не удалось скачать nope.list' <<< "$OUT" && cmp -s "$RK/save.list" "$RK/save.before" \
+    && ok "сбой скачивания не трогает наборы" || bad "сбой скачивания: код $RC, $OUT"
+
+: > "$RK/ipset.log"
+OUT=$(rkrun "a.list" --restore); RC=$?
+if [[ $RC == 0 ]] && grep -q 'ipset create -exist rkn-block hash:net family inet' "$RK/ipset.log" \
+   && grep -qx 'add rkn-block 10.0.5.7 nomatch' "$RK/ipset.log"; then
+    ok "при загрузке наборы поднимаются из сохранённой копии"
+else bad "--restore: код $RC, $OUT"; fi
+rm -f "$RK/save.list"; : > "$RK/ipset.log"
+OUT=$(rkrun "a.list" --restore); RC=$?
+[[ $RC == 0 ]] && grep -q 'ipset create -exist rkn-block6' "$RK/ipset.log" \
+    && ok "без копии при загрузке создаются пустые наборы — ufw всё равно стартует" || bad "--restore без копии: код $RC"
+rm -rf "$RK"
+
+# --------------------------------------------------------------------------
 head_ "30. shellcheck (если установлен)"
 # --------------------------------------------------------------------------
 if command -v shellcheck >/dev/null 2>&1; then

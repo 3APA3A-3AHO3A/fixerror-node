@@ -65,6 +65,19 @@ GEODATA_BIN="/usr/local/sbin/geo-update"
 GEODATA_UNIT="/etc/systemd/system/geo-update.service"
 GEODATA_TIMER="/etc/systemd/system/geo-update.timer"
 # node-pull: нода забирает с панели wildcard-сертификат и сайт утилит
+# Защита от проберов РКН: входящие соединения из госсетей и сетей сканеров
+# (списки shadow-netlab/traffic-guard-lists) отбрасываются через ipset
+RKN_BIN="/usr/local/sbin/rkn-block"
+RKN_UNIT="/etc/systemd/system/rkn-block.service"
+RKN_TIMER="/etc/systemd/system/rkn-block.timer"
+RKN_RESTORE_UNIT="/etc/systemd/system/rkn-block-restore.service"
+RKN_UFW_DROPIN="/etc/systemd/system/ufw.service.d/rkn-block.conf"
+RKN_SAVE="/etc/fixerror-node/rkn-block.list"      # последние скачанные сети: из них наборы поднимаются при загрузке
+RKN_ALLOW_FILE="/etc/fixerror-node/rkn-allow.txt"  # сети, которые не блокировать никогда
+RKN_LISTS_URL="https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/main/public"
+RKN_LISTS="government_networks.list antiscanner.list skipa.list"
+UFW_BEFORE6="/etc/ufw/before6.rules"
+
 NODE_PULL_BIN="/usr/local/sbin/node-pull"
 NODE_PULL_DIR="/etc/node-pull"
 NODE_PULL_UNIT="/etc/systemd/system/node-pull.service"
@@ -257,6 +270,14 @@ nginx_ipv6_listeners() {
 # Основной интерфейс — тот, через который идёт маршрут по умолчанию
 default_iface() {
     ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
+    return 0
+}
+
+# Сколько сетей в наборе ipset защиты от проберов РКН (0 — набора нет)
+rkn_set_count() {
+    local n
+    n=$(ipset list -t "$1" 2>/dev/null | awk -F': *' '/^Number of entries/{print $2}')
+    echo "${n:-0}"
     return 0
 }
 
@@ -581,6 +602,29 @@ rh_check() {
         else
             rhc_warn "правил против торрентов нет (в before.rules: $rhc_tor)"
             rhc_fix "торренты: меню, пункт 2 -> 5 (UFW + торренты)"
+        fi
+        local rhc_rkn rhc_rkn_age
+        rhc_rkn=$(rhc_num "$(rkn_set_count rkn-block)")
+        if [[ "$rhc_rkn" -gt 0 ]]; then
+            if ! iptables -S ufw-before-input 2>/dev/null | grep -q -- '--match-set rkn-block src'; then
+                rhc_warn "наборы защиты от проберов РКН есть ($rhc_rkn сетей), но правила в ufw нет"
+                rhc_fix "проберы РКН: меню, пункт 2 -> 28"
+            elif ! systemctl is-enabled --quiet rkn-block.timer 2>/dev/null; then
+                rhc_warn "защита от проберов РКН работает ($rhc_rkn сетей), но таймер обновления выключен"
+                rhc_fix "проберы РКН: меню, пункт 2 -> 28"
+            else
+                rhc_rkn_age=$(( ( $(date +%s) - $(stat -c %Y "$RKN_SAVE" 2>/dev/null || date +%s) ) / 86400 ))
+                if [[ "$rhc_rkn_age" -ge 3 ]]; then
+                    rhc_warn "защита от проберов РКН: списки не обновлялись $rhc_rkn_age дн. (journalctl -t rkn-block)"
+                else
+                    rhc_ok "защита от проберов РКН: $rhc_rkn сетей IPv4, $(rkn_set_count rkn-block6) IPv6, режутся новые входящие"
+                fi
+            fi
+        elif [[ -f "$RKN_BIN" ]]; then
+            rhc_bad "защита от проберов РКН ставилась, но наборов ipset нет — проберы проходят"
+            rhc_fix "проберы РКН: меню, пункт 2 -> 28"
+        else
+            rhc_info "защита от проберов РКН не стоит (меню, пункт 2 -> 28)"
         fi
     else
         rhc_bad "ufw выключен"

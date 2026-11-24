@@ -5,6 +5,7 @@
 A Remnawave node installer for FixErrorVPN. It builds a node to the same template as every other node of the service:
 - an admin account with SSH hardening, plus a separate account for AI agents;
 - a firewall with torrent blocking, fail2ban;
+- protection from RKN probers: new inbound connections from government and scanner networks are dropped, the lists are refreshed daily;
 - a shared sysctl template, MTU measurement and pinning, UTC time;
 - Docker and the node container with Loyalsoldier geo databases, updated every 3 days;
 - Xray egress options: WARP on port 6000, warp-native, Psiphon;
@@ -47,7 +48,7 @@ sudo bash /tmp/setup.sh /root/node.conf
 | Account, password, SSH port | vadim, random, 8422 |
 | SSH public key and extra keys | — |
 | AI agent key | Enter means no agent |
-| WARP, warp-native, Psiphon, Speedtest, geo databases | yes by default |
+| WARP, warp-native, Psiphon, Speedtest, geo databases, protection from RKN probers | yes by default |
 | Telegram: token, chat, topic, proxy | nodes in Russia: `socks5h://127.0.0.1:10808` |
 
 ## After install: the node key on the panel
@@ -102,6 +103,7 @@ Repair never touches the firewall, the container or the nginx site config, and n
 | SSH | `/etc/ssh/sshd_config.d/00-hardening.conf`: port 8422, root and passwords off. `Port` is written only if the main `sshd_config` lacks it: two identical `Port` lines cause "Address already in use" |
 | UFW | 8422/tcp (limit), 80/tcp, 443/tcp, 443/udp; 2222/tcp from the panel IP only; plus `UFW_EXTRA_PORTS` |
 | Torrents | 6 `-m string` rules in `/etc/ufw/before.rules`, placed before ESTABLISHED |
+| RKN probers | see below |
 | fail2ban | sshd: 4 tries → 24 h ban; recidive: 1 week |
 | sysctl | `/etc/sysctl.d/99-vpn-tune.conf`: BBR/fq, 16 MB buffers, conntrack 262144, reserved ports 8422, 2222, 9443, 6000, IPv6 off |
 | MTU | path measured with don't-fragment pings; below 1500 it is pinned by `mtu-<iface>` and set in `daemon.json` |
@@ -112,6 +114,16 @@ Repair never touches the firewall, the container or the nginx site config, and n
 | node-pull | `/usr/local/sbin/node-pull`, keys in `/etc/node-pull`, `node-pull.timer` |
 | Notifications | `/usr/local/sbin/remnawave-notify` (the same script as on the panel), `/etc/remnawave-notify.env`, `remnawave-notify-watch.service`, `@reboot`, PAM |
 | Time | UTC, chrony |
+
+### Protection from RKN probers
+
+DPI probers and scanners connect to a node like clients and recognise a VPN by its answer. The node does not answer them: inbound connections from government and scanner networks are dropped. The networks come from three lists of [shadow-netlab/traffic-guard-lists](https://github.com/shadow-netlab/traffic-guard-lists): `government_networks`, `antiscanner`, `skipa` (about 2,900 IPv4 and 30 IPv6 networks). These are the same lists rkn-guard uses, without its program and panel: just ipset and a ufw rule.
+
+- Only **new** inbound connections are dropped. Replies to connections the node opened itself pass, so clients on nodes that send all traffic through the VPN can still open government sites.
+- The panel IP is never blocked. Your own exceptions (e.g. a Russian server that forwards traffic to the node) go into `/etc/fixerror-node/rkn-allow.txt`, one per line; then run `sudo rkn-block`. At install time they can be set in `RKN_ALLOW`.
+- Updates: `/usr/local/sbin/rkn-block` + `rkn-block.timer`, daily at 02:30 UTC ± 1 h. A broken list (fewer than 500 networks), a failed download and networks wider than /16 are rejected: the sets stay as they were, and the failure is reported to Telegram at most once a day.
+- After a reboot the sets are restored from a saved copy before ufw starts (`rkn-block-restore.service`, drop-in `ufw.service.d/rkn-block.conf`). Otherwise a rule that refers to a missing set would stop ufw from starting.
+- To see what would go into the sets without changing anything: `sudo rkn-block --print`. To turn it off: menu item 2 → 28 → 2.
 
 The installer does not set up the separate xray that Russian nodes use for Telegram. If you need it, put its address into `TG_PROXY`.
 
@@ -130,6 +142,7 @@ Run the tests with `bash tests/run-tests.sh`; they need no server. Besides synta
 - the panel key line;
 - that `remnawave-notify` matches the reference `tests/remnawave-notify.ref` byte for byte;
 - safe geo database updates;
+- protection from RKN probers: list parsing, exceptions, rejecting a broken list, restoring the sets at boot;
 - that diagnostics change nothing.
 
 If `remnawave-notify` changes on the panel, update both the reference file and `lib/80-notify.sh`.

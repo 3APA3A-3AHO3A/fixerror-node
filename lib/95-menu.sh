@@ -112,6 +112,7 @@ components_menu() {
         echo "24) Учётка ИИ-агента"
         echo "25) Geo-базы Loyalsoldier + обновление раз в 3 дня"
         echo "26) warp-native (WARP интерфейсом)  27) Psiphon (SOCKS5)"
+        echo "28) Защита от проберов РКН (ipset, обновление раз в сутки)"
         echo "14) Защита диска          15) Обновить ноду  16) Статус ноды"
         echo "20) Обновить систему (apt upgrade + перезагрузка)"
         echo "--- Диагностика ---"
@@ -145,6 +146,7 @@ components_menu() {
             25) menu_step "Geo-базы"              comp_geodata ;;
             26) menu_step "warp-native"           comp_warp_native_menu ;;
             27) menu_step "Psiphon"               comp_psiphon_menu ;;
+            28) menu_step "Защита от проберов РКН" comp_rkn_block_menu ;;
              0) return ;;
              *) echo "Нет такого пункта." ;;
         esac

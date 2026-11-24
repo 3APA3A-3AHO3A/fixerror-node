@@ -276,7 +276,7 @@ comp_ufw() {
     fi
     sed -i 's|net/ipv4/icmp_echo_ignore_all=0|net/ipv4/icmp_echo_ignore_all=1|' /etc/ufw/sysctl.conf
     # Сброс ufw возвращает before.rules к заводскому — правила против торрентов
-    # вписываем после сброса и до включения.
+    # (и защиты от проберов РКН, если она стоит) вписываем после сброса и до включения.
     {
         ufw --force reset
         ufw default deny incoming
@@ -289,6 +289,7 @@ comp_ufw() {
         for p in ${UFW_EXTRA_PORTS:-}; do ufw allow "$p" comment 'extra'; done
     } >>"$SETUP_LOG" 2>&1
     torrent_rules_apply || return 1
+    rkn_rules_reapply || return 1
     ufw --force enable >>"$SETUP_LOG" 2>&1
     if ! ufw status 2>/dev/null | head -1 | grep -q 'active'; then
         echo "  [СБОЙ] ufw не включился (см. $SETUP_LOG)"

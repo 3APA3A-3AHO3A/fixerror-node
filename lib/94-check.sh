@@ -302,6 +302,29 @@ rh_check() {
             rhc_warn "правил против торрентов нет (в before.rules: $rhc_tor)"
             rhc_fix "торренты: меню, пункт 2 -> 5 (UFW + торренты)"
         fi
+        local rhc_rkn rhc_rkn_age
+        rhc_rkn=$(rhc_num "$(rkn_set_count rkn-block)")
+        if [[ "$rhc_rkn" -gt 0 ]]; then
+            if ! iptables -S ufw-before-input 2>/dev/null | grep -q -- '--match-set rkn-block src'; then
+                rhc_warn "наборы защиты от проберов РКН есть ($rhc_rkn сетей), но правила в ufw нет"
+                rhc_fix "проберы РКН: меню, пункт 2 -> 28"
+            elif ! systemctl is-enabled --quiet rkn-block.timer 2>/dev/null; then
+                rhc_warn "защита от проберов РКН работает ($rhc_rkn сетей), но таймер обновления выключен"
+                rhc_fix "проберы РКН: меню, пункт 2 -> 28"
+            else
+                rhc_rkn_age=$(( ( $(date +%s) - $(stat -c %Y "$RKN_SAVE" 2>/dev/null || date +%s) ) / 86400 ))
+                if [[ "$rhc_rkn_age" -ge 3 ]]; then
+                    rhc_warn "защита от проберов РКН: списки не обновлялись $rhc_rkn_age дн. (journalctl -t rkn-block)"
+                else
+                    rhc_ok "защита от проберов РКН: $rhc_rkn сетей IPv4, $(rkn_set_count rkn-block6) IPv6, режутся новые входящие"
+                fi
+            fi
+        elif [[ -f "$RKN_BIN" ]]; then
+            rhc_bad "защита от проберов РКН ставилась, но наборов ipset нет — проберы проходят"
+            rhc_fix "проберы РКН: меню, пункт 2 -> 28"
+        else
+            rhc_info "защита от проберов РКН не стоит (меню, пункт 2 -> 28)"
+        fi
     else
         rhc_bad "ufw выключен"
         rhc_fix "ufw: меню, пункт 2 -> 5"
