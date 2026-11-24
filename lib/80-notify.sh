@@ -20,9 +20,10 @@ notify_write_script() {
 #   remnawave-notify --planned "что"   — нода: предупредить, что remnanode сейчас перезапустят
 #                                        намеренно; --watch тогда не шлёт «нода упала»
 #
-# Настройки (TG_BOT_TOKEN, TG_CHAT_ID, TG_TOPIC_ID, TG_PROXY, SERVER_LABEL, NOTIFY_ENABLED):
+# Настройки (TG_BOT_TOKEN, TG_CHAT_ID, TG_TOPIC_ID, TG_PROXY, SERVER_LABEL, SERVER_IP, NOTIFY_ENABLED):
 #   на панели — /opt/remnawave/host/notify.env, на ноде — /etc/remnawave-notify.env.
 # NOTIFY_ENABLED=0 выключает отправку (режим обкатки).
+# Входы пользователей из группы ai-agents (ИИ-агенты) приходят как «Вход ИИ-агента» и без звука.
 
 if [ -r /opt/remnawave/host/notify.env ]; then ENV_FILE=/opt/remnawave/host/notify.env
 else ENV_FILE=/etc/remnawave-notify.env; fi
@@ -37,9 +38,10 @@ send() {
     local args=(-s --max-time 15 --retry 2 -X POST)
     [ -n "${TG_PROXY:-}" ] && args+=(-x "$TG_PROXY")
     args+=(-d "chat_id=$TG_CHAT_ID" -d "parse_mode=HTML"
-           --data-urlencode "text=🖥 <b>${SERVER_LABEL:-$(hostname)}</b>
+           --data-urlencode "text=🖥 <b>${SERVER_LABEL:-$(hostname)}</b>${SERVER_IP:+  <code>$SERVER_IP</code>}
 $1")
     [ -n "${TG_TOPIC_ID:-}" ] && args+=(-d "message_thread_id=$TG_TOPIC_ID")
+    [ "${SILENT:-0}" = 1 ] && args+=(-d "disable_notification=true")
     curl "${args[@]}" "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" >/dev/null 2>&1
 }
 
@@ -56,9 +58,13 @@ case "${1:-}" in
         [ "${PAM_TYPE:-}" = open_session ] || exit 0
         # node-pull — ноды забирают сертификат и сайт, это не вход человека
         [ "${PAM_USER:-}" = node-pull ] && exit 0
-        send "🔐 <b>Вход по SSH</b>
+        title="🔐 <b>Вход по SSH</b>"
+        if id -nG "${PAM_USER:-}" 2>/dev/null | tr ' ' '\n' | grep -qx ai-agents; then
+            title="🤖 <b>Вход ИИ-агента</b>"; SILENT=1
+        fi
+        send "$title
 Пользователь: <code>${PAM_USER:-?}</code>
-IP: <code>${PAM_RHOST:-?}</code>
+Откуда IP: <code>${PAM_RHOST:-?}</code>
 Время: $(now)" &
         exit 0 ;;
     --boot)
@@ -118,7 +124,7 @@ notify_write_env() {
     local k v
     {
         echo "# Уведомления сервера в Telegram (fixerror-node)"
-        for k in TG_BOT_TOKEN TG_CHAT_ID TG_TOPIC_ID TG_PROXY SERVER_LABEL; do
+        for k in TG_BOT_TOKEN TG_CHAT_ID TG_TOPIC_ID TG_PROXY SERVER_LABEL SERVER_IP; do
             v="${!k:-}"
             v=${v//\\/\\\\}; v=${v//\"/\\\"}; v=${v//\$/\\\$}; v=${v//\`/\\\`}
             printf '%s="%s"\n' "$k" "$v"
@@ -149,6 +155,8 @@ UNIT
 @reboot root /usr/local/sbin/remnawave-notify --boot
 CRON
     chmod 644 "$NOTIFY_CRON"
+    # Группа ИИ-агентов: их входы приходят отдельной пометкой и без звука
+    groupadd -f ai-agents
     # Вход по SSH: строку переписываем, а не дописываем, — чтобы не двоилась
     sed -i '\|remnawave-notify --ssh-login|d' /etc/pam.d/sshd
     echo "session optional pam_exec.so seteuid /usr/local/sbin/remnawave-notify --ssh-login" >> /etc/pam.d/sshd
@@ -163,6 +171,7 @@ comp_telegram() {
         return 1
     fi
     echo ">>> Настройка Telegram-уведомлений (remnawave-notify)..."
+    [[ -n "${SERVER_IP:-}" ]] || get_server_ip || true   # IP в заголовке уведомлений
     notify_write_script
     notify_write_env
     notify_write_units
@@ -179,7 +188,7 @@ comp_telegram() {
         "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
         -d "chat_id=${TG_CHAT_ID}" -d "parse_mode=HTML" \
         ${TG_TOPIC_ID:+-d "message_thread_id=${TG_TOPIC_ID}"} \
-        --data-urlencode "text=🖥 <b>${SERVER_LABEL}</b>
+        --data-urlencode "text=🖥 <b>${SERVER_LABEL}</b>${SERVER_IP:+  <code>$SERVER_IP</code>}
 ✅ Уведомления настроены (SSH-входы, загрузка, падение/подъём ноды)" 2>/dev/null || true)
     if grep -q '"ok":true' <<< "$resp"; then
         echo "  Тестовое сообщение доставлено в Telegram."
