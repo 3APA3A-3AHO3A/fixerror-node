@@ -2457,9 +2457,12 @@ DIR=$GEODATA_DIR
 URL=$GEODATA_URL
 CHECK=0; NO_RESTART=0
 case "\${1:-}" in --check) CHECK=1 ;; --no-restart) NO_RESTART=1 ;; esac
-# Под systemd вывод и так уходит в журнал — echo только при ручном запуске,
-# иначе каждая строка в журнале двоится
-log(){ [ -z "\${JOURNAL_STREAM:-}" ] && echo "\$*"; logger -t geo-update "\$*"; }
+# Под systemd вывод и так уходит в журнал — echo только когда вывод идёт не туда,
+# иначе каждая строка в журнале двоится. Сверяем сам вывод с JOURNAL_STREAM
+# (как велит systemd): одной переменной мало, её наследуют и чужие процессы.
+IN_JOURNAL=0
+[ -n "\${JOURNAL_STREAM:-}" ] && [ "\$JOURNAL_STREAM" = "\$(stat -Lc '%d:%i' /proc/\$\$/fd/1 2>/dev/null)" ] && IN_JOURNAL=1
+log(){ [ \$IN_JOURNAL = 1 ] || echo "\$*"; logger -t geo-update "\$*"; }
 
 mkdir -p "\$DIR"
 TMP=\$(mktemp -d /var/tmp/geo.XXXXXX); trap 'rm -rf "\$TMP"' EXIT
@@ -2810,9 +2813,12 @@ C=$NODE_PULL_DIR
 SSL=$NGINX_SSL
 WWW=$STUB_ROOT
 STATE=/var/lib/node-pull; mkdir -p \$STATE
-# Под systemd вывод и так уходит в журнал — echo только при ручном запуске,
-# иначе каждая строка в журнале двоится
-log(){ [ -z "\${JOURNAL_STREAM:-}" ] && echo "\$*"; logger -t node-pull "\$*"; }
+# Под systemd вывод и так уходит в журнал — echo только когда вывод идёт не туда,
+# иначе каждая строка в журнале двоится. Сверяем сам вывод с JOURNAL_STREAM
+# (как велит systemd): одной переменной мало, её наследуют и чужие процессы.
+IN_JOURNAL=0
+[ -n "\${JOURNAL_STREAM:-}" ] && [ "\$JOURNAL_STREAM" = "\$(stat -Lc '%d:%i' /proc/\$\$/fd/1 2>/dev/null)" ] && IN_JOURNAL=1
+log(){ [ \$IN_JOURNAL = 1 ] || echo "\$*"; logger -t node-pull "\$*"; }
 
 # Только один забор за раз: таймер и ручной запуск не должны мешать друг другу
 exec 9>/run/node-pull.lock
@@ -2822,6 +2828,9 @@ rm -rf "\$WWW".new.*   # остатки прерванного забора
 # Ошибка: в журнал всегда, в Telegram — не чаще раза в 12 часов
 fail(){
     log "ОШИБКА: \$*"
+    # Пока стоит временный сертификат установщика, строку ключа на панель ещё
+    # не добавили — это ожидаемо, в Telegram не пишем
+    openssl x509 -in \$SSL/fullchain.pem -noout -subject 2>/dev/null | grep -q placeholder.invalid && exit 1
     if [ -z "\$(find \$STATE/notified -mmin -720 2>/dev/null)" ] && [ -x $NOTIFY_BIN ]; then
         $NOTIFY_BIN "⚠️ <b>Не обновился сертификат/сайт с панели</b>: \$*" && touch \$STATE/notified
     fi
@@ -3870,7 +3879,8 @@ rhc_warn() { ui_warn "$*"; rhc_warnings=$((rhc_warnings+1)); return 0; }
 rhc_bad()  { ui_err "$*";  rhc_problems=$((rhc_problems+1)); return 0; }
 rhc_info() { ui_info "$*"; }
 rhc_sect() { ui_section "$*"; }
-rhc_fix()  { rhc_fixes+=("$*"); }
+# Один и тот же совет («меню, пункт 4») выдают несколько проверок — показываем его один раз
+rhc_fix()  { local f; for f in ${rhc_fixes[@]+"${rhc_fixes[@]}"}; do [[ "$f" == "$*" ]] && return 0; done; rhc_fixes+=("$*"); }
 
 # Порты, на которых сейчас слушает SSH. При socket-активации слушателем
 # выступает systemd, поэтому его тоже засчитываем.

@@ -297,7 +297,8 @@ rhc_warn() { ui_warn "$*"; rhc_warnings=$((rhc_warnings+1)); return 0; }
 rhc_bad()  { ui_err "$*";  rhc_problems=$((rhc_problems+1)); return 0; }
 rhc_info() { ui_info "$*"; }
 rhc_sect() { ui_section "$*"; }
-rhc_fix()  { rhc_fixes+=("$*"); }
+# Один и тот же совет («меню, пункт 4») выдают несколько проверок — показываем его один раз
+rhc_fix()  { local f; for f in ${rhc_fixes[@]+"${rhc_fixes[@]}"}; do [[ "$f" == "$*" ]] && return 0; done; rhc_fixes+=("$*"); }
 
 # Порты, на которых сейчас слушает SSH. При socket-активации слушателем
 # выступает systemd, поэтому его тоже засчитываем.
