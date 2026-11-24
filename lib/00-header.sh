@@ -76,6 +76,19 @@ GEODATA_BIN="/usr/local/sbin/geo-update"
 GEODATA_UNIT="/etc/systemd/system/geo-update.service"
 GEODATA_TIMER="/etc/systemd/system/geo-update.timer"
 # node-pull: нода забирает с панели wildcard-сертификат и сайт утилит
+# Защита от проберов РКН: входящие соединения из госсетей и сетей сканеров
+# (списки shadow-netlab/traffic-guard-lists) отбрасываются через ipset
+RKN_BIN="/usr/local/sbin/rkn-block"
+RKN_UNIT="/etc/systemd/system/rkn-block.service"
+RKN_TIMER="/etc/systemd/system/rkn-block.timer"
+RKN_RESTORE_UNIT="/etc/systemd/system/rkn-block-restore.service"
+RKN_UFW_DROPIN="/etc/systemd/system/ufw.service.d/rkn-block.conf"
+RKN_SAVE="/etc/fixerror-node/rkn-block.list"      # последние скачанные сети: из них наборы поднимаются при загрузке
+RKN_ALLOW_FILE="/etc/fixerror-node/rkn-allow.txt"  # сети, которые не блокировать никогда
+RKN_LISTS_URL="https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/main/public"
+RKN_LISTS="government_networks.list antiscanner.list skipa.list"
+UFW_BEFORE6="/etc/ufw/before6.rules"
+
 NODE_PULL_BIN="/usr/local/sbin/node-pull"
 NODE_PULL_DIR="/etc/node-pull"
 NODE_PULL_UNIT="/etc/systemd/system/node-pull.service"

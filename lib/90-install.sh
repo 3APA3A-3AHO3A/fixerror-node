@@ -23,7 +23,7 @@ full_install() {
             PANEL_IP=""; PANEL_HOSTKEY=""; REMNA_SECRET=""; SERVER_LABEL=""
             NODE_ROLE=""; CDN_DOMAIN=""; ROLE_ASKED=""
             SSH_PUBLIC_KEY=""; SSH_EXTRA_KEYS=""; INSTALL_WARP=""; INSTALL_SPEEDTEST=""
-            AGENT_SSH_KEYS=""; GEODATA=""; INSTALL_WARP_NATIVE=""; INSTALL_PSIPHON=""; PSIPHON_REGION=""
+            AGENT_SSH_KEYS=""; GEODATA=""; RKN_BLOCK=""; INSTALL_WARP_NATIVE=""; INSTALL_PSIPHON=""; PSIPHON_REGION=""
             REMNANODE_VERSION=""
             SSH_PORT="8422"; ADMIN_USER="vadim"
             SETUP_TG=""; TG_BOT_TOKEN=""; TG_CHAT_ID=""; TG_TOPIC_ID=""; TG_PROXY=""
@@ -64,6 +64,8 @@ full_install() {
         [[ -z "$INSTALL_SPEEDTEST" ]] && INSTALL_SPEEDTEST="y"
         [[ -z "$GEODATA" ]]           && read -ep "Geo-базы Loyalsoldier с обновлением раз в 3 дня? [Y/n]: " GEODATA
         [[ -z "$GEODATA" ]] && GEODATA="y"
+        [[ -z "${RKN_BLOCK:-}" ]]     && read -ep "Не пускать проберов РКН и сканеры (ipset, обновление раз в сутки)? [Y/n]: " RKN_BLOCK
+        [[ -z "${RKN_BLOCK:-}" ]] && RKN_BLOCK="y"
 
         ui_section "Telegram-уведомления"
         [[ -z "$SETUP_TG" && -z "$TG_BOT_TOKEN" ]] && read -ep "Настроить Telegram-уведомления? [Y/n]: " SETUP_TG
@@ -116,6 +118,7 @@ full_install() {
     do_step "fail2ban" comp_fail2ban
     do_step "Автообновления безопасности" comp_autoupdates
     do_step "UFW-фаервол + блокировка торрентов" comp_ufw
+    rkn_block_enabled && do_step "Защита от проберов РКН" comp_rkn_block || skip_step "Защита от проберов РКН"
     do_step "Sysctl-тюнинг" comp_sysctl
     do_step "MTU" comp_mtu
     do_step "Docker" comp_docker

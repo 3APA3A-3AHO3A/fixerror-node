@@ -29,6 +29,14 @@ default_iface() {
     return 0
 }
 
+# Сколько сетей в наборе ipset защиты от проберов РКН (0 — набора нет)
+rkn_set_count() {
+    local n
+    n=$(ipset list -t "$1" 2>/dev/null | awk -F': *' '/^Number of entries/{print $2}')
+    echo "${n:-0}"
+    return 0
+}
+
 # Строки правил против торрентов в before.rules ufw (сколько их там)
 torrent_rules_count() {
     local n

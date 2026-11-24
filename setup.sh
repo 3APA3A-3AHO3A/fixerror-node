@@ -2,7 +2,7 @@
 # ЭТОТ ФАЙЛ СОБРАН АВТОМАТИЧЕСКИ ИЗ lib/*.sh — НЕ РЕДАКТИРУЙТЕ ЕГО ВРУЧНУЮ.
 # Правки вносятся в lib/, затем: python3 build.py
 # Любое изменение здесь будет затёрто при следующей сборке.
-# Собрано из: 00-header.sh, 05-ui.sh, 06-spinner.sh, 07-probes.sh, 10-helpers.sh, 20-prompts.sh, 30-state.sh, 40-system.sh, 45-preflight.sh, 50-security.sh, 60-node.sh, 62-geodata.sh, 70-web.sh, 80-notify.sh, 85-extras.sh, 86-egress.sh, 90-install.sh, 92-repair.sh, 94-check.sh, 95-menu.sh, 99-main.sh
+# Собрано из: 00-header.sh, 05-ui.sh, 06-spinner.sh, 07-probes.sh, 10-helpers.sh, 20-prompts.sh, 30-state.sh, 40-system.sh, 45-preflight.sh, 50-security.sh, 52-rknblock.sh, 60-node.sh, 62-geodata.sh, 70-web.sh, 80-notify.sh, 85-extras.sh, 86-egress.sh, 90-install.sh, 92-repair.sh, 94-check.sh, 95-menu.sh, 99-main.sh
 
 # ===== lib/00-header.sh ================================================
 # ##########################################################################
@@ -82,6 +82,19 @@ GEODATA_BIN="/usr/local/sbin/geo-update"
 GEODATA_UNIT="/etc/systemd/system/geo-update.service"
 GEODATA_TIMER="/etc/systemd/system/geo-update.timer"
 # node-pull: нода забирает с панели wildcard-сертификат и сайт утилит
+# Защита от проберов РКН: входящие соединения из госсетей и сетей сканеров
+# (списки shadow-netlab/traffic-guard-lists) отбрасываются через ipset
+RKN_BIN="/usr/local/sbin/rkn-block"
+RKN_UNIT="/etc/systemd/system/rkn-block.service"
+RKN_TIMER="/etc/systemd/system/rkn-block.timer"
+RKN_RESTORE_UNIT="/etc/systemd/system/rkn-block-restore.service"
+RKN_UFW_DROPIN="/etc/systemd/system/ufw.service.d/rkn-block.conf"
+RKN_SAVE="/etc/fixerror-node/rkn-block.list"      # последние скачанные сети: из них наборы поднимаются при загрузке
+RKN_ALLOW_FILE="/etc/fixerror-node/rkn-allow.txt"  # сети, которые не блокировать никогда
+RKN_LISTS_URL="https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/main/public"
+RKN_LISTS="government_networks.list antiscanner.list skipa.list"
+UFW_BEFORE6="/etc/ufw/before6.rules"
+
 NODE_PULL_BIN="/usr/local/sbin/node-pull"
 NODE_PULL_DIR="/etc/node-pull"
 NODE_PULL_UNIT="/etc/systemd/system/node-pull.service"
@@ -371,6 +384,14 @@ nginx_ipv6_listeners() {
 # Основной интерфейс — тот, через который идёт маршрут по умолчанию
 default_iface() {
     ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
+    return 0
+}
+
+# Сколько сетей в наборе ipset защиты от проберов РКН (0 — набора нет)
+rkn_set_count() {
+    local n
+    n=$(ipset list -t "$1" 2>/dev/null | awk -F': *' '/^Number of entries/{print $2}')
+    echo "${n:-0}"
     return 0
 }
 
@@ -1093,7 +1114,7 @@ save_state() {
         for _v in PANEL_IP PANEL_HOSTKEY REMNA_SECRET REMNANODE_VERSION SERVER_LABEL \
                   NODE_ROLE STUB_NAMES CDN_DOMAIN CDN_PATH CDN_XHTTP_PORT MTU_MODE UFW_EXTRA_PORTS \
                   SSH_PUBLIC_KEY SSH_EXTRA_KEYS SSH_PORT ADMIN_USER \
-                  AGENT_USER AGENT_SSH_KEYS GEODATA INSTALL_WARP INSTALL_WARP_NATIVE \
+                  AGENT_USER AGENT_SSH_KEYS GEODATA RKN_BLOCK RKN_ALLOW INSTALL_WARP INSTALL_WARP_NATIVE \
                   INSTALL_PSIPHON PSIPHON_REGION INSTALL_SPEEDTEST SETUP_TG \
                   TG_BOT_TOKEN TG_CHAT_ID TG_TOPIC_ID TG_PROXY; do
             printf '%s=%q\n' "$_v" "${!_v-}"
@@ -2021,7 +2042,7 @@ comp_ufw() {
     fi
     sed -i 's|net/ipv4/icmp_echo_ignore_all=0|net/ipv4/icmp_echo_ignore_all=1|' /etc/ufw/sysctl.conf
     # Сброс ufw возвращает before.rules к заводскому — правила против торрентов
-    # вписываем после сброса и до включения.
+    # (и защиты от проберов РКН, если она стоит) вписываем после сброса и до включения.
     {
         ufw --force reset
         ufw default deny incoming
@@ -2034,6 +2055,7 @@ comp_ufw() {
         for p in ${UFW_EXTRA_PORTS:-}; do ufw allow "$p" comment 'extra'; done
     } >>"$SETUP_LOG" 2>&1
     torrent_rules_apply || return 1
+    rkn_rules_reapply || return 1
     ufw --force enable >>"$SETUP_LOG" 2>&1
     if ! ufw status 2>/dev/null | head -1 | grep -q 'active'; then
         echo "  [СБОЙ] ufw не включился (см. $SETUP_LOG)"
@@ -2255,6 +2277,340 @@ role = "admin"
 approvalPolicy = "auto"
 trustedHostKey = "${fp:-неизвестен}"
 EOF
+    return 0
+}
+
+# ===== lib/52-rknblock.sh ==============================================
+# ##########################################################################
+#  ЗАЩИТА ОТ ПРОБЕРОВ РКН
+#  Входящие соединения из госсетей и сетей сканеров отбрасываются: набор
+#  ipset из списков shadow-netlab/traffic-guard-lists, правило в before.rules
+#  ufw, обновление раз в сутки (systemd-таймер rkn-block.timer)
+# ##########################################################################
+
+# Зачем. Проберы ТСПУ и сканеры подключаются к ноде как клиенты и по ответу
+# узнают VPN. Если не отвечать им вовсе, узнавать нечего.
+#
+# Что режется. Только НОВЫЕ входящие соединения из этих сетей. Ответы на
+# соединения, которые открыла сама нода, проходят: клиенты на нодах, где весь
+# трафик идёт через VPN, по-прежнему открывают госсайты.
+#
+# Порядок при загрузке. Правило ufw ссылается на набор ipset, и если набора
+# нет, ufw не стартует целиком — нода остаётся без фаервола. Поэтому наборы
+# поднимаются из сохранённой копии до ufw (rkn-block-restore.service и
+# дополнение к ufw.service), а при сбое скачивания остаются прежними.
+
+RKN_MARK="# защита от проберов РКН (fixerror-node)"
+
+rkn_block_enabled() {
+    [[ "${RKN_BLOCK:-y}" =~ ^[Yy]$ ]] && return 0
+    return 1
+}
+
+# Скрипт обновления. Настройки вписываются при установке, тело — общее.
+rkn_write_updater() {
+    {
+        cat <<HEAD
+#!/bin/bash
+# Наборы ipset rkn-block / rkn-block6 для защиты от проберов РКН (fixerror-node).
+# Запуск: rkn-block            скачать списки и обновить наборы
+#         rkn-block --restore  при загрузке, до ufw: поднять наборы из сохранённой копии
+#         rkn-block --print    скачать и показать, что попадёт в наборы; ничего не менять
+set -u
+URL=\${RKN_LISTS_URL:-$RKN_LISTS_URL}
+LISTS=\${RKN_LISTS:-"$RKN_LISTS"}
+SAVE=\${RKN_SAVE:-$RKN_SAVE}
+ALLOW=\${RKN_ALLOW_FILE:-$RKN_ALLOW_FILE}
+PANEL_IP=$PANEL_IP
+NOTIFY=$NOTIFY_BIN
+HEAD
+        cat <<'BODY'
+SET4=rkn-block; SET6=rkn-block6
+MIN4=500          # меньше сетей — значит, список сломан; наборы не трогаем
+STATE=/var/lib/rkn-block
+MODE=${1:-}
+
+# Под systemd вывод и так уходит в журнал — echo только когда вывод идёт не
+# туда, иначе каждая строка в журнале двоится
+IN_JOURNAL=0
+[ -n "${JOURNAL_STREAM:-}" ] && [ "$JOURNAL_STREAM" = "$(stat -Lc '%d:%i' /proc/$$/fd/1 2>/dev/null)" ] && IN_JOURNAL=1
+log(){ [ $IN_JOURNAL = 1 ] || echo "$*"; logger -t rkn-block "$*" 2>/dev/null || true; }
+
+# Ошибка: в журнал всегда, в Telegram — не чаще раза в сутки
+fail(){
+    log "ОШИБКА: $*, наборы не тронуты"
+    mkdir -p "$STATE" 2>/dev/null
+    if [ -z "$(find "$STATE/notified" -mmin -1440 2>/dev/null)" ] && [ -x "$NOTIFY" ]; then
+        "$NOTIFY" "⚠️ <b>Не обновились сети РКН для блокировки</b>: $*" >/dev/null 2>&1 && touch "$STATE/notified"
+    fi
+    exit 1
+}
+
+create_sets(){
+    ipset create -exist $SET4 hash:net family inet maxelem 131072
+    ipset create -exist $SET6 hash:net family inet6 maxelem 131072
+}
+
+# Строки «сеть» или «сеть nomatch» в команды ipset restore для набора $1 / $2
+restore_cmds(){
+    awk -v s4="$1" -v s6="$2" '{ printf "add %s %s%s\n", (index($1, ":") ? s6 : s4), $1, ($2 == "nomatch" ? " nomatch" : "") }'
+}
+
+if [ "$MODE" = --restore ]; then
+    # Загрузка не должна сорваться ни при каком исходе: пустой набор лучше,
+    # чем ufw, который не поднялся
+    create_sets || exit 0
+    [ -s "$SAVE" ] && restore_cmds $SET4 $SET6 < "$SAVE" | ipset restore -exist 2>/dev/null
+    log "наборы подняты из сохранённой копии: $(cat "$SAVE" 2>/dev/null | grep -c .) сетей"
+    exit 0
+fi
+
+TMP=$(mktemp -d /var/tmp/rkn.XXXXXX); trap 'rm -rf "$TMP"' EXIT
+for f in $LISTS; do
+    curl -fsSL --retry 3 --max-time 120 -o "$TMP/$f" "$URL/$f" || fail "не удалось скачать $f"
+done
+
+# Берём только сети. Слишком широкие (IPv4 шире /16, IPv6 шире /24) не
+# берём: в этих списках таких нет, и если появятся, это ошибка списка,
+# которая отрезала бы от ноды целые провайдеры.
+cat "$TMP"/* | tr -d '\r' | awk '
+    { sub(/#.*/, "") }            # комментарий бывает и в конце строки с сетью
+    /^[[:space:]]*$/ { next }
+    { n = $1 }
+    n ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(\/[0-9]+)?$/ {
+        p = (n ~ /\//) ? substr(n, index(n, "/") + 1) + 0 : 32
+        if (p >= 16 && p <= 32) { print n; next }
+    }
+    n ~ /^[0-9a-fA-F:]+:[0-9a-fA-F:]*(\/[0-9]+)?$/ {
+        p = (n ~ /\//) ? substr(n, index(n, "/") + 1) + 0 : 128
+        if (p >= 24 && p <= 128) { print n; next }
+    }
+    { bad++ }
+    END { if (bad) printf "пропущено строк: %d\n", bad > "/dev/stderr" }
+' 2>"$TMP/skipped" | sort -u > "$TMP/nets"
+n4=$(grep -vc ':' "$TMP/nets"); n6=$(grep -c ':' "$TMP/nets")
+[ "$n4" -ge $MIN4 ] || fail "в списках всего $n4 сетей IPv4 — похоже, они сломаны"
+
+# Исключения: IP панели и свои сети. nomatch в hash:net перекрывает более
+# широкую сеть того же набора — адрес из исключений не блокируется никогда.
+{ [ -n "$PANEL_IP" ] && echo "$PANEL_IP"
+  [ -f "$ALLOW" ] && tr -d '\r' < "$ALLOW" | awk '!/^[[:space:]]*(#|$)/ { print $1 }'
+} | sort -u | awk '{ print $1 " nomatch" }' > "$TMP/allow"
+
+cat "$TMP/nets" "$TMP/allow" > "$TMP/list"
+msg="сетей: IPv4 $n4, IPv6 $n6, исключений $(grep -c . "$TMP/allow")"
+[ -s "$TMP/skipped" ] && msg="$msg, $(cat "$TMP/skipped")"
+
+if [ "$MODE" = --print ]; then
+    cat "$TMP/list"; log "проверка: $msg, ничего не менял"; exit 0
+fi
+
+# Новые наборы собираем рядом и подменяем разом: блокировка не исчезает
+# ни на миг, а при сбое остаётся прежней
+create_sets || fail "ipset не создал наборы"
+ipset destroy $SET4-new 2>/dev/null; ipset destroy $SET6-new 2>/dev/null
+{ echo "create $SET4-new hash:net family inet maxelem 131072"
+  echo "create $SET6-new hash:net family inet6 maxelem 131072"
+  restore_cmds $SET4-new $SET6-new < "$TMP/list"
+} | ipset restore -exist || { ipset destroy $SET4-new 2>/dev/null; ipset destroy $SET6-new 2>/dev/null; fail "ipset не принял список"; }
+ipset swap $SET4-new $SET4 && ipset swap $SET6-new $SET6 || fail "ipset не подменил наборы"
+ipset destroy $SET4-new; ipset destroy $SET6-new
+mkdir -p "$(dirname "$SAVE")"
+cp "$TMP/list" "$SAVE.tmp" && mv "$SAVE.tmp" "$SAVE"
+rm -f "$STATE/notified"
+log "наборы обновлены: $msg"
+BODY
+    } > "$RKN_BIN"
+    chmod 755 "$RKN_BIN"
+    return 0
+}
+
+rkn_write_units() {
+    # Подъём наборов до ufw. Без [Install]: его тянет за собой сам ufw через
+    # дополнение ниже — тогда порядок соблюдается при любом способе запуска ufw.
+    cat <<UNIT > "$RKN_RESTORE_UNIT"
+[Unit]
+Description=Наборы ipset для защиты от проберов РКН (до ufw)
+DefaultDependencies=no
+After=local-fs.target systemd-modules-load.service
+Before=ufw.service network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$RKN_BIN --restore
+UNIT
+    mkdir -p "$(dirname "$RKN_UFW_DROPIN")"
+    cat <<'UNIT' > "$RKN_UFW_DROPIN"
+# fixerror-node: правило ufw ссылается на наборы ipset — поднять их раньше
+[Unit]
+Wants=rkn-block-restore.service
+After=rkn-block-restore.service
+UNIT
+    cat <<UNIT > "$RKN_UNIT"
+[Unit]
+Description=Обновление сетей РКН для блокировки входящих
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$RKN_BIN
+UNIT
+    # Раз в сутки; разброс в час — чтобы ноды не ходили на GitHub разом
+    cat <<'UNIT' > "$RKN_TIMER"
+[Unit]
+Description=Обновление сетей РКН для блокировки раз в сутки
+
+[Timer]
+OnCalendar=*-*-* 02:30:00 UTC
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+    return 0
+}
+
+# Строки правил для before.rules ($1 = 4) или before6.rules ($1 = 6)
+rkn_rules_render() {
+    local chain="ufw-before-input" set="rkn-block"
+    [[ "$1" == 6 ]] && { chain="ufw6-before-input"; set="rkn-block6"; }
+    echo "$RKN_MARK"
+    echo "-A $chain -m conntrack --ctstate NEW -m set --match-set $set src -j DROP"
+    return 0
+}
+
+# Вписывает правило в файл ($1) после «# End required lines»; старые строки
+# убирает, поэтому повторный запуск ничего не дублирует. Без $2 — только убрать.
+rkn_rules_write() {
+    local file="$1" blk="${2:-}" tmp
+    [[ -f "$file" ]] || return 0
+    tmp=$(mktemp)
+    if ! grep -v -e '--match-set rkn-block' -e "^$RKN_MARK" "$file" \
+        | awk -v blk="$blk" '
+            { print }
+            blk != "" && /^# End required lines/ && !done { print blk; done=1 }
+            END { if (blk != "" && !done) exit 3 }' > "$tmp"; then
+        rm -f "$tmp"
+        echo "  [СБОЙ] в $file нет строки «# End required lines» — правило не вставлено"
+        return 1
+    fi
+    cat "$tmp" > "$file"
+    rm -f "$tmp"
+    return 0
+}
+
+rkn_rules_apply() {
+    rkn_rules_write "$UFW_BEFORE" "$(rkn_rules_render 4)" || return 1
+    rkn_rules_write "$UFW_BEFORE6" "$(rkn_rules_render 6)" || return 1
+    return 0
+}
+
+rkn_rules_remove() {
+    rkn_rules_write "$UFW_BEFORE" || return 1
+    rkn_rules_write "$UFW_BEFORE6" || return 1
+    return 0
+}
+
+rkn_sets_exist() {
+    ipset list -n rkn-block >/dev/null 2>&1 && ipset list -n rkn-block6 >/dev/null 2>&1 && return 0
+    return 1
+}
+
+# После сброса ufw (пункт «UFW + торренты») правило пропадает вместе с
+# before.rules. Возвращаем его, только если наборы уже есть: правило без
+# набора не даст ufw включиться.
+rkn_rules_reapply() {
+    rkn_block_enabled || return 0
+    rkn_sets_exist || return 0
+    rkn_rules_apply || return 1
+    return 0
+}
+
+rkn_write_allow() {
+    local n
+    mkdir -p "$(dirname "$RKN_ALLOW_FILE")"
+    if [[ ! -f "$RKN_ALLOW_FILE" ]]; then
+        {
+            echo "# Сети и адреса, которые защита от проберов РКН не блокирует никогда,"
+            echo "# по одной на строку. IP панели добавляется сам. После правки: sudo rkn-block"
+        } > "$RKN_ALLOW_FILE"
+    fi
+    for n in ${RKN_ALLOW:-}; do
+        grep -qxF "$n" "$RKN_ALLOW_FILE" || echo "$n" >> "$RKN_ALLOW_FILE"
+    done
+    return 0
+}
+
+comp_rkn_block() {
+    echo ">>> Защита от проберов РКН (ipset)..."
+    ufw status 2>/dev/null | head -1 | grep -q 'active' \
+        || { echo "  [СБОЙ] ufw не включён — сначала пункт 2 -> 5 (UFW + торренты)"; return 1; }
+    apt-get "${APT_WAIT[@]}" install -y ipset >>"$SETUP_LOG" 2>&1 || true
+    command -v ipset >/dev/null 2>&1 || { echo "  [СБОЙ] не удалось поставить ipset (см. $SETUP_LOG)"; return 1; }
+    rkn_write_allow
+    rkn_write_updater
+    rkn_write_units
+    systemctl daemon-reload >>"$SETUP_LOG" 2>&1
+
+    # Сначала наборы, потом правило: наоборот ufw не перезагрузится
+    if ! "$RKN_BIN"; then
+        echo "  [СБОЙ] не удалось скачать списки (журнал: journalctl -t rkn-block)"
+        rkn_sets_exist && [[ -s "$RKN_SAVE" ]] || return 1
+        echo "  Прежние наборы на месте — продолжаю с ними."
+    fi
+    rkn_sets_exist || { echo "  [СБОЙ] наборов ipset нет после обновления"; return 1; }
+    echo "  В наборах: IPv4 $(rkn_set_count rkn-block), IPv6 $(rkn_set_count rkn-block6)"
+
+    rkn_rules_apply || return 1
+    if ! ufw reload >>"$SETUP_LOG" 2>&1; then
+        echo "  [СБОЙ] ufw не перезагрузился с правилом — убираю правило"
+        rkn_rules_remove; ufw reload >>"$SETUP_LOG" 2>&1 || true
+        return 1
+    fi
+    iptables -S ufw-before-input 2>/dev/null | grep -q -- '--match-set rkn-block src' \
+        || { echo "  [СБОЙ] правило не появилось в ufw-before-input"; return 1; }
+
+    systemctl enable --now rkn-block.timer >>"$SETUP_LOG" 2>&1 || true
+    systemctl is-enabled --quiet rkn-block.timer 2>/dev/null \
+        || { echo "  [СБОЙ] таймер rkn-block.timer не включился"; return 1; }
+    echo "  Режутся новые входящие из этих сетей; ответы на исходящие проходят"
+    echo "  Обновление: раз в сутки в 02:30 UTC, плюс до часа"
+    echo "  Исключения: $RKN_ALLOW_FILE (IP панели — всегда)"
+    return 0
+}
+
+# Выключение: правило, таймер и наборы убираются, сохранённая копия остаётся
+rkn_block_off() {
+    echo ">>> Выключаю защиту от проберов РКН..."
+    rkn_rules_remove || return 1
+    ufw reload >>"$SETUP_LOG" 2>&1 || { echo "  [СБОЙ] ufw не перезагрузился"; return 1; }
+    systemctl disable --now rkn-block.timer >>"$SETUP_LOG" 2>&1 || true
+    rm -f "$RKN_UFW_DROPIN"
+    systemctl daemon-reload >>"$SETUP_LOG" 2>&1
+    ipset destroy rkn-block 2>/dev/null || true
+    ipset destroy rkn-block6 2>/dev/null || true
+    RKN_BLOCK="n"; save_state
+    echo "  Выключено. Включить снова: меню, пункт 2 -> 28."
+    return 0
+}
+
+comp_rkn_block_menu() {
+    local a=""
+    if rkn_sets_exist; then
+        echo "  Защита включена: IPv4 $(rkn_set_count rkn-block), IPv6 $(rkn_set_count rkn-block6) сетей."
+        read -ep "  1 — обновить и переустановить, 2 — выключить, Enter — назад: " a || a=""
+        case "$a" in
+            1) ;;
+            2) rkn_block_off; return $? ;;
+            *) return 0 ;;
+        esac
+    fi
+    RKN_BLOCK="y"
+    comp_rkn_block || return 1
+    save_state
     return 0
 }
 
@@ -3441,7 +3797,7 @@ full_install() {
             PANEL_IP=""; PANEL_HOSTKEY=""; REMNA_SECRET=""; SERVER_LABEL=""
             NODE_ROLE=""; CDN_DOMAIN=""; ROLE_ASKED=""
             SSH_PUBLIC_KEY=""; SSH_EXTRA_KEYS=""; INSTALL_WARP=""; INSTALL_SPEEDTEST=""
-            AGENT_SSH_KEYS=""; GEODATA=""; INSTALL_WARP_NATIVE=""; INSTALL_PSIPHON=""; PSIPHON_REGION=""
+            AGENT_SSH_KEYS=""; GEODATA=""; RKN_BLOCK=""; INSTALL_WARP_NATIVE=""; INSTALL_PSIPHON=""; PSIPHON_REGION=""
             REMNANODE_VERSION=""
             SSH_PORT="8422"; ADMIN_USER="vadim"
             SETUP_TG=""; TG_BOT_TOKEN=""; TG_CHAT_ID=""; TG_TOPIC_ID=""; TG_PROXY=""
@@ -3482,6 +3838,8 @@ full_install() {
         [[ -z "$INSTALL_SPEEDTEST" ]] && INSTALL_SPEEDTEST="y"
         [[ -z "$GEODATA" ]]           && read -ep "Geo-базы Loyalsoldier с обновлением раз в 3 дня? [Y/n]: " GEODATA
         [[ -z "$GEODATA" ]] && GEODATA="y"
+        [[ -z "${RKN_BLOCK:-}" ]]     && read -ep "Не пускать проберов РКН и сканеры (ipset, обновление раз в сутки)? [Y/n]: " RKN_BLOCK
+        [[ -z "${RKN_BLOCK:-}" ]] && RKN_BLOCK="y"
 
         ui_section "Telegram-уведомления"
         [[ -z "$SETUP_TG" && -z "$TG_BOT_TOKEN" ]] && read -ep "Настроить Telegram-уведомления? [Y/n]: " SETUP_TG
@@ -3534,6 +3892,7 @@ full_install() {
     do_step "fail2ban" comp_fail2ban
     do_step "Автообновления безопасности" comp_autoupdates
     do_step "UFW-фаервол + блокировка торрентов" comp_ufw
+    rkn_block_enabled && do_step "Защита от проберов РКН" comp_rkn_block || skip_step "Защита от проберов РКН"
     do_step "Sysctl-тюнинг" comp_sysctl
     do_step "MTU" comp_mtu
     do_step "Docker" comp_docker
@@ -3692,7 +4051,7 @@ repair_perms() {
 # исполняется через /bin/sh, где нет [[ ]], и молча не работает.
 repair_verify() {
     local f bad=""
-    for f in "$NOTIFY_BIN" "$GEODATA_BIN" "$NODE_PULL_BIN"; do
+    for f in "$NOTIFY_BIN" "$GEODATA_BIN" "$NODE_PULL_BIN" "$RKN_BIN"; do
         [[ -f "$f" ]] || continue
         head -1 "$f" | grep -q '^#!' || bad+=" $(basename "$f")"
     done
@@ -4164,6 +4523,29 @@ rh_check() {
             rhc_warn "правил против торрентов нет (в before.rules: $rhc_tor)"
             rhc_fix "торренты: меню, пункт 2 -> 5 (UFW + торренты)"
         fi
+        local rhc_rkn rhc_rkn_age
+        rhc_rkn=$(rhc_num "$(rkn_set_count rkn-block)")
+        if [[ "$rhc_rkn" -gt 0 ]]; then
+            if ! iptables -S ufw-before-input 2>/dev/null | grep -q -- '--match-set rkn-block src'; then
+                rhc_warn "наборы защиты от проберов РКН есть ($rhc_rkn сетей), но правила в ufw нет"
+                rhc_fix "проберы РКН: меню, пункт 2 -> 28"
+            elif ! systemctl is-enabled --quiet rkn-block.timer 2>/dev/null; then
+                rhc_warn "защита от проберов РКН работает ($rhc_rkn сетей), но таймер обновления выключен"
+                rhc_fix "проберы РКН: меню, пункт 2 -> 28"
+            else
+                rhc_rkn_age=$(( ( $(date +%s) - $(stat -c %Y "$RKN_SAVE" 2>/dev/null || date +%s) ) / 86400 ))
+                if [[ "$rhc_rkn_age" -ge 3 ]]; then
+                    rhc_warn "защита от проберов РКН: списки не обновлялись $rhc_rkn_age дн. (journalctl -t rkn-block)"
+                else
+                    rhc_ok "защита от проберов РКН: $rhc_rkn сетей IPv4, $(rkn_set_count rkn-block6) IPv6, режутся новые входящие"
+                fi
+            fi
+        elif [[ -f "$RKN_BIN" ]]; then
+            rhc_bad "защита от проберов РКН ставилась, но наборов ipset нет — проберы проходят"
+            rhc_fix "проберы РКН: меню, пункт 2 -> 28"
+        else
+            rhc_info "защита от проберов РКН не стоит (меню, пункт 2 -> 28)"
+        fi
     else
         rhc_bad "ufw выключен"
         rhc_fix "ufw: меню, пункт 2 -> 5"
@@ -4634,6 +5016,7 @@ components_menu() {
         echo "24) Учётка ИИ-агента"
         echo "25) Geo-базы Loyalsoldier + обновление раз в 3 дня"
         echo "26) warp-native (WARP интерфейсом)  27) Psiphon (SOCKS5)"
+        echo "28) Защита от проберов РКН (ipset, обновление раз в сутки)"
         echo "14) Защита диска          15) Обновить ноду  16) Статус ноды"
         echo "20) Обновить систему (apt upgrade + перезагрузка)"
         echo "--- Диагностика ---"
@@ -4667,6 +5050,7 @@ components_menu() {
             25) menu_step "Geo-базы"              comp_geodata ;;
             26) menu_step "warp-native"           comp_warp_native_menu ;;
             27) menu_step "Psiphon"               comp_psiphon_menu ;;
+            28) menu_step "Защита от проберов РКН" comp_rkn_block_menu ;;
              0) return ;;
              *) echo "Нет такого пункта." ;;
         esac
