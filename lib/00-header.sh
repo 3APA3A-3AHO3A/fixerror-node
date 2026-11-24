@@ -88,6 +88,22 @@ RKN_ALLOW_FILE="/etc/fixerror-node/rkn-allow.txt"  # сети, которые н
 RKN_LISTS_URL="https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/main/public"
 RKN_LISTS="government_networks.list antiscanner.list skipa.list"
 UFW_BEFORE6="/etc/ufw/before6.rules"
+# Сети CDN-провайдера по умолчанию: на CDN-нодах клиенты приходят с них, и
+# если списки РКН их когда-нибудь заденут, нода останется без клиентов
+CDN_RKN_ALLOW_DEFAULT="188.72.110.0/22"
+# Свой xray-клиент на нодах в РФ: через него ходят Telegram-уведомления ноды
+# (api.telegram.org из РФ закрыт). Конфиг — «Автовыбор» из подписки FixErrorVPN,
+# обновляется таймером. Слушает только 127.0.0.1.
+XRAYC_BIN="/usr/local/bin/xray"
+XRAYC_CFG="/usr/local/etc/xray/config.json"
+XRAYC_UNIT="/etc/systemd/system/xray.service"
+XRAYC_DROPIN="/etc/systemd/system/xray.service.d/20-geodata.conf"
+XRAYC_SUB_FILE="/etc/fixerror-node/xray-sub.url"     # ссылка подписки (секрет, 600)
+XRAYC_UPDATER="/usr/local/sbin/xray-sub-update"
+XRAYC_SUB_UNIT="/etc/systemd/system/xray-sub-update.service"
+XRAYC_SUB_TIMER="/etc/systemd/system/xray-sub-update.timer"
+XRAYC_REL_URL="https://github.com/XTLS/Xray-core/releases/latest/download"
+XRAYC_PROXY="socks5h://127.0.0.1:10808"
 
 NODE_PULL_BIN="/usr/local/sbin/node-pull"
 NODE_PULL_DIR="/etc/node-pull"

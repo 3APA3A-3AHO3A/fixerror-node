@@ -23,7 +23,8 @@ full_install() {
             PANEL_IP=""; PANEL_HOSTKEY=""; REMNA_SECRET=""; SERVER_LABEL=""
             NODE_ROLE=""; CDN_DOMAIN=""; ROLE_ASKED=""
             SSH_PUBLIC_KEY=""; SSH_EXTRA_KEYS=""; INSTALL_WARP=""; INSTALL_SPEEDTEST=""
-            AGENT_SSH_KEYS=""; GEODATA=""; RKN_BLOCK=""; INSTALL_WARP_NATIVE=""; INSTALL_PSIPHON=""; PSIPHON_REGION=""
+            AGENT_SSH_KEYS=""; GEODATA=""; RKN_BLOCK=""; RKN_ALLOW=""; INSTALL_WARP_NATIVE=""; INSTALL_PSIPHON=""; PSIPHON_REGION=""
+            INSTALL_XRAY_CLIENT=""; XRAY_SUB_URL=""
             REMNANODE_VERSION=""
             SSH_PORT="8422"; ADMIN_USER="vadim"
             SETUP_TG=""; TG_BOT_TOKEN=""; TG_CHAT_ID=""; TG_TOPIC_ID=""; TG_PROXY=""
@@ -60,19 +61,35 @@ full_install() {
             read -ep "Страна выхода Psiphon, две буквы (Enter — страна сервера): " PSIPHON_REGION
             PSIPHON_REGION=$(echo "$PSIPHON_REGION" | tr -d '[:space:]' | tr 'a-z' 'A-Z')
         fi
+        [[ -z "$INSTALL_XRAY_CLIENT" ]] && read -ep "Свой xray-клиент для Telegram (нужен нодам в РФ, конфиг из подписки)? [y/N]: " INSTALL_XRAY_CLIENT
+        [[ -z "$INSTALL_XRAY_CLIENT" ]] && INSTALL_XRAY_CLIENT="n"
         [[ -z "$INSTALL_SPEEDTEST" ]] && read -ep "Speedtest CLI? [Y/n]: " INSTALL_SPEEDTEST
         [[ -z "$INSTALL_SPEEDTEST" ]] && INSTALL_SPEEDTEST="y"
         [[ -z "$GEODATA" ]]           && read -ep "Geo-базы Loyalsoldier с обновлением раз в 3 дня? [Y/n]: " GEODATA
         [[ -z "$GEODATA" ]] && GEODATA="y"
         [[ -z "${RKN_BLOCK:-}" ]]     && read -ep "Не пускать проберов РКН и сканеры (ipset, обновление раз в сутки)? [Y/n]: " RKN_BLOCK
         [[ -z "${RKN_BLOCK:-}" ]] && RKN_BLOCK="y"
+        ask_cdn_allow
+        if xrayc_wanted; then
+            ui_section "Свой xray-клиент для Telegram"
+            ask_xray_sub || return 1
+            [[ -z "${TG_PROXY:-}" ]] && TG_PROXY="$XRAYC_PROXY"
+        fi
 
-        ui_section "Telegram-уведомления"
-        [[ -z "$SETUP_TG" && -z "$TG_BOT_TOKEN" ]] && read -ep "Настроить Telegram-уведомления? [Y/n]: " SETUP_TG
-        [[ -z "$SETUP_TG" && -z "$TG_BOT_TOKEN" ]] && SETUP_TG="y"
-        [[ "$SETUP_TG" =~ ^[Yy]$ || -n "$TG_BOT_TOKEN" ]] && ask_telegram
+        ui_section "Telegram-уведомления (обязательно)"
+        ask_telegram
     fi
-    [[ "$SETUP_TG" =~ ^[Yy]$ || -n "$TG_BOT_TOKEN" ]] && TG_ON=1 || TG_ON=""
+    # Без файла ответов ask_* выше уже спросили; с ним — те же значения по умолчанию
+    [[ -n "$NONINTERACTIVE" ]] && ask_cdn_allow
+    # С xray-клиентом Telegram по умолчанию идёт через него, а geo-базы нужны
+    # его конфигу (он берёт базы ноды)
+    if xrayc_wanted; then
+        [[ -z "${TG_PROXY:-}" ]] && TG_PROXY="$XRAYC_PROXY"
+        GEODATA="y"
+    fi
+    # Уведомления не пропускаются: шаг всегда в списке, и без токена он честно
+    # падает в сводке, а не тихо значится «пропущен»
+    SETUP_TG="y"
 
     save_state   # запомнить ответы для будущих обновлений
     get_server_ip || true
@@ -127,10 +144,13 @@ full_install() {
     [[ "$INSTALL_WARP" =~ ^[Yy]$ ]] && do_step "Cloudflare WARP" comp_warp || skip_step "Cloudflare WARP"
     [[ "${INSTALL_WARP_NATIVE:-n}" =~ ^[Yy]$ ]] && do_step "warp-native" comp_warp_native || skip_step "warp-native"
     [[ "${INSTALL_PSIPHON:-n}" =~ ^[Yy]$ ]] && do_step "Psiphon" comp_psiphon || skip_step "Psiphon"
-    # Telegram — до ноды: тогда сторож и плановые перезапуски работают с самого начала
-    [[ -n "$TG_ON" ]] && do_step "Telegram-уведомления" comp_telegram || skip_step "Telegram-уведомления"
-    # Базы — до ноды: тогда compose сразу пишется с томами
+    # Базы — до ноды: тогда compose сразу пишется с томами. И до xray-клиента:
+    # его конфиг ссылается на те же geo-базы
     [[ "${GEODATA:-y}" =~ ^[Yy]$ ]] && do_step "Geo-базы (Loyalsoldier)" comp_geodata || skip_step "Geo-базы (Loyalsoldier)"
+    # xray-клиент — до Telegram: на нодах в РФ уведомления идут только через него
+    xrayc_wanted && do_step "xray-клиент для Telegram" comp_xray_client || skip_step "xray-клиент для Telegram"
+    # Telegram — до ноды: тогда сторож и плановые перезапуски работают с самого начала
+    do_step "Telegram-уведомления" comp_telegram
     do_step "Нода Remnanode" comp_node
     do_step "Сайт ноды в nginx" comp_web_site
     do_step "node-pull (сертификат и сайт с панели)" comp_node_pull
@@ -146,7 +166,9 @@ full_install() {
 
     if [[ -z "$NONINTERACTIVE" ]]; then
         echo
-        ui_info "отчёт сохранён в $REPORT_FILE, там же пароль учётки и строка для панели"
+        ui_info "отчёт сохранён в $REPORT_FILE, там же строка для панели"
+        [[ "$ADMIN_PASS_SOURCE" == "generated" ]] && \
+            ui_warn "пароль учётки показан выше один раз: ни в отчёт, ни в журнал он не записан"
         if [[ -n "${NODE_PULL_PENDING:-}" ]]; then
             ui_warn "не забудьте добавить строку node-pull на панели (она выше, в отчёте)"
         fi

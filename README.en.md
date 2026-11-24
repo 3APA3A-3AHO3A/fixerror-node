@@ -11,7 +11,8 @@ A Remnawave node installer for FixErrorVPN. It builds a node to the same templat
 - Xray egress options: WARP on port 6000, warp-native, Psiphon;
 - nginx with the tools site;
 - **node-pull**: the node fetches its certificate and site from the panel;
-- Telegram notifications via `remnawave-notify`.
+- Telegram notifications via `remnawave-notify` (mandatory);
+- an optional xray client for Telegram on Russian nodes, configured from a subscription.
 
 One downloaded file covers the node's whole life cycle: install, diagnostics, targeted repair.
 
@@ -49,7 +50,8 @@ sudo bash /tmp/setup.sh /root/node.conf
 | SSH public key and extra keys | — |
 | AI agent key | Enter means no agent |
 | WARP, warp-native, Psiphon, Speedtest, geo databases, protection from RKN probers | yes by default |
-| Telegram: token, chat, topic, proxy | nodes in Russia: `socks5h://127.0.0.1:10808` |
+| Own xray client for Telegram and its subscription link | no by default; needed on Russian nodes |
+| Telegram: token, chat, topic, proxy | mandatory; with the own xray client the proxy is filled in automatically |
 
 ## After install: the node key on the panel
 
@@ -120,12 +122,19 @@ Repair never touches the firewall, the container or the nginx site config, and n
 DPI probers and scanners connect to a node like clients and recognise a VPN by its answer. The node does not answer them: inbound connections from government and scanner networks are dropped. The networks come from three lists of [shadow-netlab/traffic-guard-lists](https://github.com/shadow-netlab/traffic-guard-lists): `government_networks`, `antiscanner`, `skipa` (about 2,900 IPv4 and 30 IPv6 networks). These are the same lists rkn-guard uses, without its program and panel: just ipset and a ufw rule.
 
 - Only **new** inbound connections are dropped. Replies to connections the node opened itself pass, so clients on nodes that send all traffic through the VPN can still open government sites.
-- The panel IP is never blocked. Your own exceptions (e.g. a Russian server that forwards traffic to the node) go into `/etc/fixerror-node/rkn-allow.txt`, one per line; then run `sudo rkn-block`. At install time they can be set in `RKN_ALLOW`.
+- The panel IP is never blocked. On CDN nodes the installer also exempts the CDN provider networks (`188.72.110.0/22` by default, can be changed), because clients arrive from there. Your own exceptions (e.g. a Russian server that forwards traffic to the node) go into `/etc/fixerror-node/rkn-allow.txt`, one per line; then run `sudo rkn-block`. At install time they can be set in `RKN_ALLOW`.
 - Updates: `/usr/local/sbin/rkn-block` + `rkn-block.timer`, daily at 02:30 UTC ± 1 h. A broken list (fewer than 500 networks), a failed download and networks wider than /16 are rejected: the sets stay as they were, and the failure is reported to Telegram at most once a day.
 - After a reboot the sets are restored from a saved copy before ufw starts (`rkn-block-restore.service`, drop-in `ufw.service.d/rkn-block.conf`). Otherwise a rule that refers to a missing set would stop ufw from starting.
 - To see what would go into the sets without changing anything: `sudo rkn-block --print`. To turn it off: menu item 2 → 28 → 2.
 
-The installer does not set up the separate xray that Russian nodes use for Telegram. If you need it, put its address into `TG_PROXY`.
+### Own xray client for Telegram (Russian nodes)
+
+api.telegram.org is blocked from Russia, so node notifications go through a separate xray. The installer asks whether to install it (no by default) and asks for a FixErrorVPN subscription link of a service user (e.g. MONITORING).
+
+- Xray comes from the official XTLS release, checked against its SHA-256. It listens only on `127.0.0.1:10808` (socks) and `10809` (http); `TG_PROXY` defaults to `socks5h://127.0.0.1:10808`.
+- The config is "Автовыбор" (AutoBalancer template) from the subscription: Russian traffic goes direct, everything else via the best live server. `xray-sub-update.timer` refreshes it every 6 hours and 5 minutes after boot.
+- A new config is applied only if it passes `xray -test` and Telegram opens through it; otherwise the old one stays, and the failure is reported to Telegram at most once a day. Log: `journalctl -t xray-sub`.
+- Geo databases are shared with the node (`/opt/remnanode/geodata`), so they are always enabled together with the client.
 
 ## Development
 

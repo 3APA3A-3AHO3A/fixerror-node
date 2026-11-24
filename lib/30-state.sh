@@ -103,6 +103,11 @@ detect_existing_setup() {
         done
         [[ -n "$TG_BOT_TOKEN" && -z "${SETUP_TG:-}" ]] && SETUP_TG="y"
     fi
+    # Свой xray-клиент (ноды в РФ): ссылка подписки — из его файла
+    if [[ -z "${XRAY_SUB_URL:-}" && -s "$XRAYC_SUB_FILE" ]]; then
+        XRAY_SUB_URL=$(tr -d '[:space:]' < "$XRAYC_SUB_FILE")
+        INSTALL_XRAY_CLIENT="y"
+    fi
     # Имя ноды — ещё и из комментария ключа node-pull
     if [[ -z "${SERVER_LABEL:-}" && -f "$NODE_PULL_DIR/key.pub" ]]; then
         SERVER_LABEL=$(awk '{ $1=""; $2=""; sub(/^  /,""); sub(/^node-pull /,""); print }' "$NODE_PULL_DIR/key.pub")
@@ -122,6 +127,7 @@ save_state() {
                   SSH_PUBLIC_KEY SSH_EXTRA_KEYS SSH_PORT ADMIN_USER \
                   AGENT_USER AGENT_SSH_KEYS GEODATA RKN_BLOCK RKN_ALLOW INSTALL_WARP INSTALL_WARP_NATIVE \
                   INSTALL_PSIPHON PSIPHON_REGION INSTALL_SPEEDTEST SETUP_TG \
+                  INSTALL_XRAY_CLIENT XRAY_SUB_URL \
                   TG_BOT_TOKEN TG_CHAT_ID TG_TOPIC_ID TG_PROXY; do
             printf '%s=%q\n' "$_v" "${!_v-}"
         done
