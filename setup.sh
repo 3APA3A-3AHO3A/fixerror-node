@@ -2964,6 +2964,20 @@ geodata_profile_block() {
         "$GEODATA_URL" "$GEODATA_URL"
 }
 
+# Возраст баз — для мониторинга: раз в 15 минут cron кладёт время изменения
+# файлов в текстовый сборщик node_exporter. Обновление сломалось (пропал блок
+# geodata в профиле, нода не видит GitHub) — мониторинг узнает об этом сам.
+GEODATA_AGE_CRON="/etc/cron.d/rwmon-geodata"
+GEODATA_PROM_DIR="/var/lib/prometheus/node-exporter"
+
+geodata_age_cron() {
+    cat > "$GEODATA_AGE_CRON" <<EOF
+# fixerror-node: возраст geo-баз для node_exporter (алерт мониторинга «Geo-базы не обновляются»)
+*/15 * * * * root d=$GEODATA_PROM_DIR; [ -d \$d ] && { for f in geoip geosite; do echo "rwmon_geodata_mtime_seconds{file=\"\$f.dat\"} \$(stat -c \%Y $GEODATA_DIR/\$f.dat 2>/dev/null || echo 0)"; done > \$d/rwmon-geodata.prom.tmp && mv \$d/rwmon-geodata.prom.tmp \$d/rwmon-geodata.prom; }
+EOF
+    chmod 644 "$GEODATA_AGE_CRON"
+}
+
 comp_geodata() {
     echo ">>> Geo-базы Loyalsoldier..."
     if ! geodata_download; then
@@ -2973,6 +2987,7 @@ comp_geodata() {
     geodata_present || { echo "  [СБОЙ] баз нет после скачивания"; return 1; }
     echo "  Базы на месте: $(du -ch "$GEODATA_DIR"/*.dat | tail -1 | cut -f1)"
     node_dir_perms
+    geodata_age_cron
 
     # Прежнее обновление таймером перезапускало ноду. Теперь базы обновляет
     # ядро — таймер выключаем, чтобы не было двух обновлений и лишних
@@ -5061,6 +5076,12 @@ rh_check() {
                 rhc_fix "geo-базы: меню, пункт 4 (починка)"
             else
                 rhc_ok "каталог geo-баз подключён целиком — базы обновляет ядро Xray"
+            fi
+            if [[ -f /etc/cron.d/rwmon-geodata ]]; then
+                rhc_ok "возраст geo-баз уходит в мониторинг (cron rwmon-geodata)"
+            else
+                rhc_warn "нет cron rwmon-geodata — мониторинг не узнает, если базы перестанут обновляться"
+                rhc_fix "geo-базы: меню, пункт 2 -> 25"
             fi
             if systemctl is-enabled --quiet geo-update.timer 2>/dev/null; then
                 rhc_warn "включён старый таймер geo-update — он перезапускает ноду, а базы и так обновляет ядро"

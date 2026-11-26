@@ -463,6 +463,12 @@ rh_check() {
             else
                 rhc_ok "каталог geo-баз подключён целиком — базы обновляет ядро Xray"
             fi
+            if [[ -f /etc/cron.d/rwmon-geodata ]]; then
+                rhc_ok "возраст geo-баз уходит в мониторинг (cron rwmon-geodata)"
+            else
+                rhc_warn "нет cron rwmon-geodata — мониторинг не узнает, если базы перестанут обновляться"
+                rhc_fix "geo-базы: меню, пункт 2 -> 25"
+            fi
             if systemctl is-enabled --quiet geo-update.timer 2>/dev/null; then
                 rhc_warn "включён старый таймер geo-update — он перезапускает ноду, а базы и так обновляет ядро"
                 rhc_fix "geo-базы: меню, пункт 4 (починка)"
