@@ -521,6 +521,7 @@ auth = "key"
 keyRef = 'C:\Users\ВАШ_ПОЛЬЗОВАТЕЛЬ\.ssh\КЛЮЧ_АГЕНТА'
 role = "admin"
 approvalPolicy = "auto"
+group = "sudo"
 trustedHostKey = "${fp:-неизвестен}"
 EOF
     return 0
