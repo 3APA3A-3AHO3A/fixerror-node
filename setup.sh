@@ -4025,6 +4025,9 @@ psiphon_socks_addr() {
     return 0
 }
 
+# Страны, где у Psiphon есть выходы (список из справки vps-psiphon)
+PSIPHON_COUNTRIES="AT AU BE BR CA CH CZ DE DK ES FR GB ID IE IN IT JP NL NO PL RS SE SG US"
+
 comp_psiphon() {
     echo ">>> Psiphon (SOCKS5 на порту $PSIPHON_PORT)..."
     if ! command -v docker >/dev/null 2>&1; then
@@ -4045,6 +4048,11 @@ comp_psiphon() {
         if [[ " RU BY IR SY CU KP CN VE " == *" $region "* ]]; then
             echo "  Сервер в $region — выход в этой стране Psiphon запрещён, регион выберет сам."
             region=""
+        elif [[ -n "$region" && " $PSIPHON_COUNTRIES " != *" $region "* ]]; then
+            # Страну vps-psiphon не проверяет: выхода в ней у Psiphon нет —
+            # туннель так и не поднимется. Берём US, как на нодах в Финляндии.
+            echo "  Выходов Psiphon в $region нет — беру US."
+            region="US"
         fi
     fi
     if psiphon_active && [[ -z "${RH_FORCE:-}" ]]; then
