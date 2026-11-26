@@ -58,12 +58,10 @@ PSIPHON_PORT="1080"     # SOCKS5 Psiphon (vps-psiphon), им пользуетс�
 # Сторонние установщики выходов — прямо из их репозиториев на GitHub
 WARP_NATIVE_URL="https://raw.githubusercontent.com/distillium/warp-native/main/install.sh"
 PSIPHON_URL="https://raw.githubusercontent.com/Chara-Freedom/vps-psiphon/main/psiphon_install.sh"
-# Geo-базы для Xray внутри ноды (Loyalsoldier): обновление раз в 3 дня
+# Geo-базы для Xray внутри ноды (Loyalsoldier): каталог подключается в
+# контейнер целиком, обновляет базы само ядро (блок geodata в профиле панели)
 GEODATA_DIR="/opt/remnanode/geodata"
 GEODATA_URL="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download"
-GEODATA_BIN="/usr/local/sbin/geo-update"
-GEODATA_UNIT="/etc/systemd/system/geo-update.service"
-GEODATA_TIMER="/etc/systemd/system/geo-update.timer"
 # node-pull: нода забирает с панели wildcard-сертификат и сайт утилит
 # Защита от проберов РКН: входящие соединения из госсетей и сетей сканеров
 # (списки shadow-netlab/traffic-guard-lists) отбрасываются через ipset
@@ -111,7 +109,7 @@ CDN_XHTTP_PORT_DEFAULT="4443"
 SYSCTL_FILE="/etc/sysctl.d/99-vpn-tune.conf"
 FAIL2BAN_JAIL="/etc/fail2ban/jail.local"
 # Группа, по которой скрипт узнаёт учётки ИИ-агентов (Claude и др. через MCP)
-AGENT_GROUP="fx-agents"
+AGENT_GROUP="ai-agents"
 # apt с версии 2.0 умеет сам ждать освобождения блокировки dpkg. Без этого на
 # свежем сервере установщик встречался с первым после загрузки
 # unattended-upgrades, падал на первой же команде — и за ним рушилось всё,
@@ -122,7 +120,7 @@ AGENT_GROUP="fx-agents"
 APT_WAIT=(-o DPkg::Lock::Timeout=600
           -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
 # Пакеты из apt — один список на установку и на отчёт о версиях
-APT_PACKAGES="sudo curl wget unzip git tmux cron ufw fail2ban python3-systemd socat jq nginx openssl dnsutils chrony iproute2 iputils-ping iperf3 btop ncdu"
+APT_PACKAGES="sudo curl wget unzip git tmux cron ufw fail2ban python3-systemd socat jq nginx openssl dnsutils chrony iproute2 iputils-ping iperf3 btop ncdu etckeeper vnstat mtr-tiny lynis prometheus-node-exporter"
 # =================
 
 if locale -a 2>/dev/null | grep -qix 'C\.UTF-*8'; then export LC_ALL=C.UTF-8; fi
@@ -408,6 +406,21 @@ rh_check() {
         rhc_fix "swap: меню, пункт 2 -> 7"
     else
         rhc_ok "swap: $(swapon --show=SIZE --noheadings 2>/dev/null | tr -d ' \n')"
+    fi
+    local rhc_jmax
+    rhc_jmax=$(systemd-analyze cat-config systemd/journald.conf 2>/dev/null \
+        | grep -E '^[[:space:]]*SystemMaxUse=' | tail -1 | cut -d= -f2)
+    if [[ "$rhc_jmax" == "1G" ]]; then
+        rhc_ok "журнал systemd: до 1 ГБ"
+    else
+        rhc_warn "журнал systemd: лимит ${rhc_jmax:-не задан}, а по образцу 1 ГБ (другой дроп-ин в journald.conf.d перебивает 99-size.conf?)"
+        rhc_fix "журнал: меню, пункт 2 -> 14"
+    fi
+    if systemctl is-active --quiet prometheus-node-exporter 2>/dev/null; then
+        rhc_ok "node_exporter работает (графики сервера в Grafana)"
+    else
+        rhc_warn "node_exporter не работает — графиков сервера в Grafana не будет"
+        rhc_fix "node_exporter: sudo apt install prometheus-node-exporter"
     fi
 
     # ----------------------------------------------------------------------
@@ -743,26 +756,30 @@ rh_check() {
             fi
         fi
 
-        # Geo-базы: свои (Loyalsoldier, обновляются cron) или встроенные в образ
+        # Geo-базы: свои (Loyalsoldier, обновляет само ядро) или встроенные в образ
         local rhc_age f
-        if grep -q "$GEODATA_DIR/geosite.dat" "$rhc_compose" 2>/dev/null; then
+        if grep -q "$GEODATA_DIR" "$rhc_compose" 2>/dev/null; then
             for f in geoip.dat geosite.dat; do
                 if [[ ! -s "$GEODATA_DIR/$f" ]]; then
-                    rhc_bad "в compose подключён $GEODATA_DIR/$f, а файла нет — Xray не стартует"
+                    rhc_bad "в compose подключён $GEODATA_DIR, а $f в нём нет — Xray не стартует"
                     rhc_fix "geo-базы: меню, пункт 2 -> 25"
                     continue
                 fi
                 rhc_age=$(( ( $(date +%s) - $(stat -c %Y "$GEODATA_DIR/$f") ) / 86400 ))
-                if [[ "$rhc_age" -gt 7 ]]; then
-                    rhc_warn "$f не обновлялся $rhc_age дн. — журнал: journalctl -t geo-update"
+                if [[ "$rhc_age" -gt 3 ]]; then
+                    rhc_warn "$f не обновлялся $rhc_age дн. — есть ли в конфиг-профиле ноды блок geodata? (docker logs remnanode | grep -i geodata)"
                 else
                     rhc_ok "$f свежий (обновлён $rhc_age дн. назад)"
                 fi
             done
-            if [[ -x "$GEODATA_BIN" ]] && systemctl is-enabled --quiet geo-update.timer 2>/dev/null; then
-                rhc_ok "обновление geo-баз раз в 3 дня включено"
+            if grep -q "$GEODATA_DIR/geo" "$rhc_compose" 2>/dev/null; then
+                rhc_warn "geo-базы подключены пофайлово (:ro) — ядро не сможет их обновить"
+                rhc_fix "geo-базы: меню, пункт 4 (починка)"
             else
-                rhc_warn "geo-базы подключены, но таймер geo-update.timer не включён"
+                rhc_ok "каталог geo-баз подключён целиком — базы обновляет ядро Xray"
+            fi
+            if systemctl is-enabled --quiet geo-update.timer 2>/dev/null; then
+                rhc_warn "включён старый таймер geo-update — он перезапускает ноду, а базы и так обновляет ядро"
                 rhc_fix "geo-базы: меню, пункт 4 (починка)"
             fi
         else

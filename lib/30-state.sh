@@ -122,7 +122,7 @@ save_state() {
     # Значения экранируются через %q: файл потом читается через "source" от root,
     # и секрет вида a$(команда) иначе выполнился бы, а пароль с $ — молча испортился.
     {
-        for _v in PANEL_IP PANEL_HOSTKEY REMNA_SECRET REMNANODE_VERSION SERVER_LABEL \
+        for _v in PANEL_IP MONITOR_IP PANEL_HOSTKEY REMNA_SECRET REMNANODE_VERSION SERVER_LABEL \
                   NODE_ROLE STUB_NAMES CDN_DOMAIN CDN_PATH CDN_XHTTP_PORT MTU_MODE UFW_EXTRA_PORTS \
                   SSH_PUBLIC_KEY SSH_EXTRA_KEYS SSH_PORT ADMIN_USER \
                   AGENT_USER AGENT_SSH_KEYS GEODATA RKN_BLOCK RKN_ALLOW INSTALL_WARP INSTALL_WARP_NATIVE \

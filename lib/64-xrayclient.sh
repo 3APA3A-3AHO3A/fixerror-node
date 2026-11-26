@@ -78,10 +78,10 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 UNIT
     fi
-    # Geo-базы — те же, что у ноды: их и так раз в 3 дня обновляет geo-update
+    # Geo-базы — те же, что у ноды: их обновляет ядро ноды (блок geodata в профиле)
     mkdir -p "$(dirname "$XRAYC_DROPIN")"
     cat <<UNIT > "$XRAYC_DROPIN"
-# fixerror-node: geo-базы — общие с нодой ($GEODATA_DIR, обновляет geo-update)
+# fixerror-node: geo-базы — общие с нодой ($GEODATA_DIR, обновляет ядро ноды)
 [Service]
 Environment=XRAY_LOCATION_ASSET=$GEODATA_DIR
 UNIT

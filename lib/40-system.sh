@@ -276,7 +276,30 @@ comp_disk() {
 [Journal]
 SystemMaxUse=1G
 EOF
+    journald_foreign_fix
     systemctl restart systemd-journald >>"$SETUP_LOG" 2>&1 || true
+    echo "  Журнал systemd: $(journald_max_use)"
+    return 0
+}
+
+# Действующее значение SystemMaxUse (последнее по порядку чтения файлов)
+journald_max_use() {
+    systemd-analyze cat-config systemd/journald.conf 2>/dev/null \
+        | grep -E '^[[:space:]]*SystemMaxUse=' | tail -1 | cut -d= -f2
+}
+
+# Дроп-ины journald читаются по алфавиту, и выигрывает последний: чужой
+# size.conf (его кладут другие установщики) идёт после 99-size.conf и молча
+# возвращает свой лимит. Его строки лимитов комментируем (бэкап рядом).
+journald_foreign_fix() {
+    local f
+    for f in /etc/systemd/journald.conf.d/*.conf; do
+        [[ -f "$f" && "$f" != */99-size.conf ]] || continue
+        grep -qE '^[[:space:]]*System(MaxUse|MaxFileSize)=' "$f" || continue
+        cp -a "$f" "$f.bak.$(date +%Y%m%d%H%M%S)"
+        sed -i -E 's|^([[:space:]]*System(MaxUse\|MaxFileSize)=)|# отключено fixerror-node (лимит в 99-size.conf): \1|' "$f"
+        echo "  $(basename "$f") перебивал лимит журнала — строки закомментированы"
+    done
     return 0
 }
 

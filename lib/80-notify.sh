@@ -19,6 +19,9 @@ notify_write_script() {
 #   remnawave-notify --watch           — нода: следить за контейнером remnanode (служба systemd)
 #   remnawave-notify --planned "что"   — нода: предупредить, что remnanode сейчас перезапустят
 #                                        намеренно; --watch тогда не шлёт «нода упала»
+#   remnawave-notify --reboot-check    — сообщить, что после обновлений нужна перезагрузка
+#                                        (сразу, потом раз в 7 дней, пока не перезагрузят);
+#                                        на ноде его зовёт --watch раз в 6 часов, на панели — --run-backup
 #
 # Настройки (TG_BOT_TOKEN, TG_CHAT_ID, TG_TOPIC_ID, TG_PROXY, SERVER_LABEL, SERVER_IP, NOTIFY_ENABLED):
 #   на панели — /opt/remnawave/host/notify.env, на ноде — /etc/remnawave-notify.env.
@@ -30,6 +33,7 @@ else ENV_FILE=/etc/remnawave-notify.env; fi
 [ -r "$ENV_FILE" ] && . "$ENV_FILE"
 
 PLANNED=/run/remnawave-notify.planned   # метка планового перезапуска
+REBOOT_SENT=/var/lib/remnawave-notify.reboot   # когда последний раз напоминали о перезагрузке
 DOWN=/run/remnawave-notify.down         # метка «нода лежит, уже сообщили»
 
 send() {
@@ -81,10 +85,20 @@ case "${1:-}" in
 Подробности: <code>$LOG</code>"
         fi
         fresh=$(find /opt/rw-backup-restore/backup -maxdepth 1 -name '*.tar.gz' -mmin -120 2>/dev/null | head -n 1)
-        [ -n "$fresh" ] || send "⚠️ <b>Нет свежего бэкапа</b>: нового архива нет больше 2 часов" ;;
+        [ -n "$fresh" ] || send "⚠️ <b>Нет свежего бэкапа</b>: нового архива нет больше 2 часов"
+        "$0" --reboot-check ;;
+    --reboot-check)
+        # Ядро и библиотеки обновляются сами, но в силу вступают только после перезагрузки
+        [ -f /var/run/reboot-required ] || { rm -f "$REBOOT_SENT"; exit 0; }
+        [ -n "$(find "$REBOOT_SENT" -mtime -7 2>/dev/null)" ] && exit 0
+        pk=$(sort -u /var/run/reboot-required.pkgs 2>/dev/null | head -5 | tr '\n' ' ' | sed 's/ $//')
+        send "♻️ <b>Нужна перезагрузка</b> после обновлений${pk:+: <code>$pk</code>}
+Перезагрузите, когда удобно: <code>sudo reboot</code>" && touch "$REBOOT_SENT" ;;
     --planned)
         printf '%s' "${2:-плановые работы}" > "$PLANNED" ;;
     --watch)
+        # Раз в 6 часов — не нужна ли перезагрузка (фоновый цикл живёт вместе со службой)
+        ( while :; do "$0" --reboot-check; sleep 21600; done ) &
         # docker events отдаёт события контейнера remnanode; при падении — тревога,
         # при плановом перезапуске — одно спокойное сообщение после подъёма
         docker events --filter container=remnanode --filter event=start --filter event=die \
@@ -106,7 +120,7 @@ case "${1:-}" in
         done
         exit 1 ;;   # docker events завершился (перезапуск docker) — systemd запустит заново
     "")
-        echo "Использование: $0 \"текст\" | --ssh-login | --boot | --run-backup | --watch | --planned \"что\"" >&2
+        echo "Использование: $0 \"текст\" | --ssh-login | --boot | --run-backup | --watch | --planned \"что\" | --reboot-check" >&2
         exit 1 ;;
     *)
         send "$1" ;;

@@ -7,8 +7,9 @@ A Remnawave node installer for FixErrorVPN. It builds a node to the same templat
 - a firewall with torrent blocking, fail2ban;
 - protection from RKN probers: new inbound connections from government and scanner networks are dropped, the lists are refreshed daily;
 - a shared sysctl template, MTU measurement and pinning, UTC time;
-- Docker and the node container with Loyalsoldier geo databases, updated every 3 days;
+- Docker and the node container with Loyalsoldier geo databases; the Xray core updates them itself, without restarting the node;
 - Xray egress options: WARP on port 6000, warp-native, Psiphon;
+- for Grafana graphs and bookkeeping: node_exporter (port 9100 for the monitoring server only), vnstat, etckeeper, lynis, mtr;
 - nginx with the tools site;
 - **node-pull**: the node fetches its certificate and site from the panel;
 - Telegram notifications via `remnawave-notify` (mandatory);
@@ -94,28 +95,29 @@ Repair works from a fixed list. It prints a plan first, then waits for your answ
 - docker group membership for the admin account;
 - `remnawave-notify`, its service, `@reboot` and the PAM line;
 - the node-pull script and timer;
-- the geo-update script and timer.
+- geo databases in the old layout (per-file mounts and the geo-update timer) are moved to a directory the core updates; the node container is recreated, about 10 seconds of downtime.
 
-Repair never touches the firewall, the container or the nginx site config, and never reboots.
+Repair never touches the firewall or the nginx site config, and never reboots. The node container is recreated only by the geo databases item.
 
 ## What gets installed
 
 | What | How |
 |---|---|
-| SSH | `/etc/ssh/sshd_config.d/00-hardening.conf`: port 8422, root and passwords off. `Port` is written only if the main `sshd_config` lacks it: two identical `Port` lines cause "Address already in use" |
-| UFW | 8422/tcp (limit), 80/tcp, 443/tcp, 443/udp; 2222/tcp from the panel IP only; plus `UFW_EXTRA_PORTS` |
+| SSH | `/etc/ssh/sshd_config.d/00-hardening.conf`: port 8422, root and passwords off, agent and TCP forwarding off, verbose login log (`LogLevel VERBOSE`). `Port` is written only if the main `sshd_config` lacks it: two identical `Port` lines cause "Address already in use" |
+| UFW | 8422/tcp, 80/tcp, 443/tcp, 443/udp; 2222/tcp from the panel IP only; 9100/tcp (node_exporter) from `MONITOR_IP` only (empty means the panel IP); plus `UFW_EXTRA_PORTS`. SSH uses allow, not limit: limit cuts off agents that open many short sessions, brute force is impossible anyway (keys only), and fail2ban handles the rest |
 | Torrents | 6 `-m string` rules in `/etc/ufw/before.rules`, placed before ESTABLISHED |
 | RKN probers | see below |
 | fail2ban | sshd: 4 tries → 24 h ban; recidive: 1 week |
 | sysctl | `/etc/sysctl.d/99-vpn-tune.conf`: BBR/fq, 16 MB buffers, conntrack 262144, reserved ports 8422, 2222, 9443, 6000, IPv6 off |
 | MTU | path measured with don't-fragment pings; below 1500 it is pinned by `mtu-<iface>` and set in `daemon.json` |
 | Docker | `daemon.json`: log rotation 10 MB × 3; systemd journal capped at 1 GB |
-| Node | `/opt/remnanode/docker-compose.yml`, host network, geo databases mounted from `/opt/remnanode/geodata` |
-| Geo databases | `/usr/local/sbin/geo-update` + `geo-update.timer`: every 3 days at 01:00 UTC ± 15 min; sha256 check; the node restarts only when the databases changed |
+| Node | `/opt/remnanode/docker-compose.yml`, host network, the `/opt/remnanode/geodata` directory mounted whole and writable; the node directory belongs to the admin account |
+| Geo databases | the installer puts them in place once (sha256 checked). After that the Xray core updates them from the `geodata` block in the panel config profile: downloads next to the file, renames it into place and reloads without a restart. The installer prints the block at the end of the step; you add it to the profile yourself |
 | Site | Reality: `stub.conf` (self-steal on 127.0.0.1:9443, PROXY protocol). CDN: `<domain>.conf` (443, site + XHTTP to Xray) |
 | node-pull | `/usr/local/sbin/node-pull`, keys in `/etc/node-pull`, `node-pull.timer` |
 | Notifications | `/usr/local/sbin/remnawave-notify` (the same script as on the panel), `/etc/remnawave-notify.env`, `remnawave-notify-watch.service`, `@reboot`, PAM |
 | Time | UTC, chrony |
+| Bookkeeping and audit | `prometheus-node-exporter` (Grafana graphs), `vnstat` (traffic), `etckeeper` (`/etc` history in git), `lynis` (daily audit), `mtr-tiny` |
 
 ### Protection from RKN probers
 
@@ -150,7 +152,7 @@ Run the tests with `bash tests/run-tests.sh`; they need no server. Besides synta
 - the site config for both roles, and rollback when `nginx -t` fails;
 - the panel key line;
 - that `remnawave-notify` matches the reference `tests/remnawave-notify.ref` byte for byte;
-- safe geo database updates;
+- the first geo database download (a broken file never replaces a working one) and moving the compose mount to a directory;
 - protection from RKN probers: list parsing, exceptions, rejecting a broken list, restoring the sets at boot;
 - that diagnostics change nothing.
 

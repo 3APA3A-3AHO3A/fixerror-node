@@ -85,14 +85,10 @@ repair_node_pull() {
     return 1
 }
 
-repair_geodata_timer() {
-    geodata_write_updater
-    geodata_write_units
-    systemctl daemon-reload >>"$SETUP_LOG" 2>&1
-    systemctl enable --now geo-update.timer >>"$SETUP_LOG" 2>&1 || true
-    systemctl is-enabled --quiet geo-update.timer 2>/dev/null || { echo "  [СБОЙ] таймер не включился"; return 1; }
-    echo "  Таймер geo-update включён: $(systemctl show -p NextElapseUSecRealtime --value geo-update.timer 2>/dev/null)"
-    return 0
+# Переход на обновление баз самим ядром: каталог целиком в compose (передеплой
+# ноды), старый таймер выключается. Базы перекачиваются, если на GitHub новее.
+repair_geodata() {
+    RH_FULL_INSTALL="" comp_geodata
 }
 
 repair_perms() {
@@ -103,7 +99,7 @@ repair_perms() {
         [[ -f "$f" ]] && { chmod 600 "$f" || rc=1; }
     done
     [[ -d "$NODE_PULL_DIR" ]] && { chmod 700 "$NODE_PULL_DIR" || rc=1; }
-    echo "  Права приведены к 600 (каталог ноды — 750 с группой docker)."
+    echo "  Права приведены к 600 (каталог ноды — владелец $ADMIN_USER)."
     return $rc
 }
 
@@ -111,7 +107,7 @@ repair_perms() {
 # исполняется через /bin/sh, где нет [[ ]], и молча не работает.
 repair_verify() {
     local f bad=""
-    for f in "$NOTIFY_BIN" "$GEODATA_BIN" "$NODE_PULL_BIN" "$RKN_BIN"; do
+    for f in "$NOTIFY_BIN" "$NODE_PULL_BIN" "$RKN_BIN"; do
         [[ -f "$f" ]] || continue
         head -1 "$f" | grep -q '^#!' || bad+=" $(basename "$f")"
     done
@@ -138,7 +134,7 @@ repair_build_plan() {
     REPAIR_SKIPS=()
 
     repair_add repair_perms "Права на файлы с секретами" \
-        "chmod 600 на install.conf, notify.env, ключ node-pull, ключ сертификата, лог, отчёт и compose; каталог ноды — 750 с группой docker"
+        "chmod 600 на install.conf, notify.env, ключ node-pull, ключ сертификата, лог, отчёт и compose; каталог ноды — владельцу-админу (755), каталог баз — 775"
 
     if [[ -f "$SSH_HARDEN_FILE" ]]; then
         repair_add repair_ssh_hardening "Харденинг SSH" \
@@ -168,9 +164,9 @@ repair_build_plan() {
         repair_note "node-pull — ключа ноды нет, ставится пунктом 2 -> 4"
     fi
 
-    if [[ -f "$GEODATA_DIR/geosite.dat" ]]; then
-        repair_add repair_geodata_timer "Обновление geo-баз" \
-            "перезапишет geo-update и его таймер (раз в 3 дня), включит таймер; базы не перекачивает"
+    if [[ -f /opt/remnanode/docker-compose.yml ]] && { geodata_legacy_mount || geodata_legacy_timer; }; then
+        repair_add repair_geodata "Geo-базы: обновление самим ядром" \
+            "подключит каталог баз в ноду целиком с записью (передеплой ноды, ~10 сек простоя), выключит таймер geo-update"
     fi
 
     if ipv6_off_or_pending && nginx_ipv6_listeners | grep -qx default; then

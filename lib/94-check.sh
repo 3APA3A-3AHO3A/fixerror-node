@@ -92,6 +92,21 @@ rh_check() {
     else
         rhc_ok "swap: $(swapon --show=SIZE --noheadings 2>/dev/null | tr -d ' \n')"
     fi
+    local rhc_jmax
+    rhc_jmax=$(systemd-analyze cat-config systemd/journald.conf 2>/dev/null \
+        | grep -E '^[[:space:]]*SystemMaxUse=' | tail -1 | cut -d= -f2)
+    if [[ "$rhc_jmax" == "1G" ]]; then
+        rhc_ok "журнал systemd: до 1 ГБ"
+    else
+        rhc_warn "журнал systemd: лимит ${rhc_jmax:-не задан}, а по образцу 1 ГБ (другой дроп-ин в journald.conf.d перебивает 99-size.conf?)"
+        rhc_fix "журнал: меню, пункт 2 -> 14"
+    fi
+    if systemctl is-active --quiet prometheus-node-exporter 2>/dev/null; then
+        rhc_ok "node_exporter работает (графики сервера в Grafana)"
+    else
+        rhc_warn "node_exporter не работает — графиков сервера в Grafana не будет"
+        rhc_fix "node_exporter: sudo apt install prometheus-node-exporter"
+    fi
 
     # ----------------------------------------------------------------------
     rhc_sect "SSH"
@@ -426,26 +441,30 @@ rh_check() {
             fi
         fi
 
-        # Geo-базы: свои (Loyalsoldier, обновляются cron) или встроенные в образ
+        # Geo-базы: свои (Loyalsoldier, обновляет само ядро) или встроенные в образ
         local rhc_age f
-        if grep -q "$GEODATA_DIR/geosite.dat" "$rhc_compose" 2>/dev/null; then
+        if grep -q "$GEODATA_DIR" "$rhc_compose" 2>/dev/null; then
             for f in geoip.dat geosite.dat; do
                 if [[ ! -s "$GEODATA_DIR/$f" ]]; then
-                    rhc_bad "в compose подключён $GEODATA_DIR/$f, а файла нет — Xray не стартует"
+                    rhc_bad "в compose подключён $GEODATA_DIR, а $f в нём нет — Xray не стартует"
                     rhc_fix "geo-базы: меню, пункт 2 -> 25"
                     continue
                 fi
                 rhc_age=$(( ( $(date +%s) - $(stat -c %Y "$GEODATA_DIR/$f") ) / 86400 ))
-                if [[ "$rhc_age" -gt 7 ]]; then
-                    rhc_warn "$f не обновлялся $rhc_age дн. — журнал: journalctl -t geo-update"
+                if [[ "$rhc_age" -gt 3 ]]; then
+                    rhc_warn "$f не обновлялся $rhc_age дн. — есть ли в конфиг-профиле ноды блок geodata? (docker logs remnanode | grep -i geodata)"
                 else
                     rhc_ok "$f свежий (обновлён $rhc_age дн. назад)"
                 fi
             done
-            if [[ -x "$GEODATA_BIN" ]] && systemctl is-enabled --quiet geo-update.timer 2>/dev/null; then
-                rhc_ok "обновление geo-баз раз в 3 дня включено"
+            if grep -q "$GEODATA_DIR/geo" "$rhc_compose" 2>/dev/null; then
+                rhc_warn "geo-базы подключены пофайлово (:ro) — ядро не сможет их обновить"
+                rhc_fix "geo-базы: меню, пункт 4 (починка)"
             else
-                rhc_warn "geo-базы подключены, но таймер geo-update.timer не включён"
+                rhc_ok "каталог geo-баз подключён целиком — базы обновляет ядро Xray"
+            fi
+            if systemctl is-enabled --quiet geo-update.timer 2>/dev/null; then
+                rhc_warn "включён старый таймер geo-update — он перезапускает ноду, а базы и так обновляет ядро"
                 rhc_fix "geo-базы: меню, пункт 4 (починка)"
             fi
         else

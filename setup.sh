@@ -75,12 +75,10 @@ PSIPHON_PORT="1080"     # SOCKS5 Psiphon (vps-psiphon), им пользуетс�
 # Сторонние установщики выходов — прямо из их репозиториев на GitHub
 WARP_NATIVE_URL="https://raw.githubusercontent.com/distillium/warp-native/main/install.sh"
 PSIPHON_URL="https://raw.githubusercontent.com/Chara-Freedom/vps-psiphon/main/psiphon_install.sh"
-# Geo-базы для Xray внутри ноды (Loyalsoldier): обновление раз в 3 дня
+# Geo-базы для Xray внутри ноды (Loyalsoldier): каталог подключается в
+# контейнер целиком, обновляет базы само ядро (блок geodata в профиле панели)
 GEODATA_DIR="/opt/remnanode/geodata"
 GEODATA_URL="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download"
-GEODATA_BIN="/usr/local/sbin/geo-update"
-GEODATA_UNIT="/etc/systemd/system/geo-update.service"
-GEODATA_TIMER="/etc/systemd/system/geo-update.timer"
 # node-pull: нода забирает с панели wildcard-сертификат и сайт утилит
 # Защита от проберов РКН: входящие соединения из госсетей и сетей сканеров
 # (списки shadow-netlab/traffic-guard-lists) отбрасываются через ipset
@@ -128,7 +126,7 @@ CDN_XHTTP_PORT_DEFAULT="4443"
 SYSCTL_FILE="/etc/sysctl.d/99-vpn-tune.conf"
 FAIL2BAN_JAIL="/etc/fail2ban/jail.local"
 # Группа, по которой скрипт узнаёт учётки ИИ-агентов (Claude и др. через MCP)
-AGENT_GROUP="fx-agents"
+AGENT_GROUP="ai-agents"
 # apt с версии 2.0 умеет сам ждать освобождения блокировки dpkg. Без этого на
 # свежем сервере установщик встречался с первым после загрузки
 # unattended-upgrades, падал на первой же команде — и за ним рушилось всё,
@@ -139,7 +137,7 @@ AGENT_GROUP="fx-agents"
 APT_WAIT=(-o DPkg::Lock::Timeout=600
           -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
 # Пакеты из apt — один список на установку и на отчёт о версиях
-APT_PACKAGES="sudo curl wget unzip git tmux cron ufw fail2ban python3-systemd socat jq nginx openssl dnsutils chrony iproute2 iputils-ping iperf3 btop ncdu"
+APT_PACKAGES="sudo curl wget unzip git tmux cron ufw fail2ban python3-systemd socat jq nginx openssl dnsutils chrony iproute2 iputils-ping iperf3 btop ncdu etckeeper vnstat mtr-tiny lynis prometheus-node-exporter"
 # =================
 
 # RH_LIB_ONLY=1 — загрузить только функции, ничего не выполняя (используется тестами)
@@ -1165,7 +1163,7 @@ save_state() {
     # Значения экранируются через %q: файл потом читается через "source" от root,
     # и секрет вида a$(команда) иначе выполнился бы, а пароль с $ — молча испортился.
     {
-        for _v in PANEL_IP PANEL_HOSTKEY REMNA_SECRET REMNANODE_VERSION SERVER_LABEL \
+        for _v in PANEL_IP MONITOR_IP PANEL_HOSTKEY REMNA_SECRET REMNANODE_VERSION SERVER_LABEL \
                   NODE_ROLE STUB_NAMES CDN_DOMAIN CDN_PATH CDN_XHTTP_PORT MTU_MODE UFW_EXTRA_PORTS \
                   SSH_PUBLIC_KEY SSH_EXTRA_KEYS SSH_PORT ADMIN_USER \
                   AGENT_USER AGENT_SSH_KEYS GEODATA RKN_BLOCK RKN_ALLOW INSTALL_WARP INSTALL_WARP_NATIVE \
@@ -1474,7 +1472,30 @@ comp_disk() {
 [Journal]
 SystemMaxUse=1G
 EOF
+    journald_foreign_fix
     systemctl restart systemd-journald >>"$SETUP_LOG" 2>&1 || true
+    echo "  Журнал systemd: $(journald_max_use)"
+    return 0
+}
+
+# Действующее значение SystemMaxUse (последнее по порядку чтения файлов)
+journald_max_use() {
+    systemd-analyze cat-config systemd/journald.conf 2>/dev/null \
+        | grep -E '^[[:space:]]*SystemMaxUse=' | tail -1 | cut -d= -f2
+}
+
+# Дроп-ины journald читаются по алфавиту, и выигрывает последний: чужой
+# size.conf (его кладут другие установщики) идёт после 99-size.conf и молча
+# возвращает свой лимит. Его строки лимитов комментируем (бэкап рядом).
+journald_foreign_fix() {
+    local f
+    for f in /etc/systemd/journald.conf.d/*.conf; do
+        [[ -f "$f" && "$f" != */99-size.conf ]] || continue
+        grep -qE '^[[:space:]]*System(MaxUse|MaxFileSize)=' "$f" || continue
+        cp -a "$f" "$f.bak.$(date +%Y%m%d%H%M%S)"
+        sed -i -E 's|^([[:space:]]*System(MaxUse\|MaxFileSize)=)|# отключено fixerror-node (лимит в 99-size.conf): \1|' "$f"
+        echo "  $(basename "$f") перебивал лимит журнала — строки закомментированы"
+    done
     return 0
 }
 
@@ -1951,6 +1972,9 @@ PasswordAuthentication no
 KbdInteractiveAuthentication no
 PubkeyAuthentication yes
 X11Forwarding no
+LogLevel VERBOSE
+AllowAgentForwarding no
+AllowTcpForwarding no
 EOF
     return 0
 }
@@ -2076,6 +2100,9 @@ comp_ssh() {
 
 comp_ufw() {
     ask_panel_ip
+    # node_exporter (графики сервера в Grafana) — только для сервера мониторинга
+    local mon="${MONITOR_IP:-$PANEL_IP}"
+    [[ "$mon" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || mon="$PANEL_IP"
     echo ">>> Настройка UFW..."
     # Открываем целевой порт + все, на которых SSH может быть прямо сейчас.
     # Иначе при отложенном применении порта фаервол запер бы нас снаружи.
@@ -2104,11 +2131,15 @@ comp_ufw() {
         ufw --force reset
         ufw default deny incoming
         ufw default allow outgoing
-        for p in $ssh_ports; do ufw limit "$p/tcp" comment 'SSH'; done
+        # allow, а не limit: limit режет седьмое подключение за 30 секунд, и
+        # агенты с частыми короткими сессиями упирались в него. Перебор паролей
+        # всё равно невозможен (только ключи), а частых гостей банит fail2ban.
+        for p in $ssh_ports; do ufw allow "$p/tcp" comment 'SSH'; done
         ufw allow 80/tcp comment 'HTTP'
         ufw allow 443/tcp comment 'HTTPS'
         ufw allow 443/udp comment 'QUIC / Hysteria2'
         ufw allow from "$PANEL_IP" to any port "$NODE_PORT" proto tcp comment 'API panel'
+        ufw allow from "$mon" to any port 9100 proto tcp comment 'node_exporter'
         for p in ${UFW_EXTRA_PORTS:-}; do ufw allow "$p" comment 'extra'; done
     } >>"$SETUP_LOG" 2>&1
     torrent_rules_apply || return 1
@@ -2705,17 +2736,20 @@ docker_group_member() {
     return 0
 }
 
-# Каталог ноды: 750 и группа docker. Заходить в него и смотреть geo-базы могут
-# админ-учётка и агент (оба в группе docker), а сам docker-compose.yml с
-# SECRET_KEY остаётся 600 — секрет защищён на уровне файла. Раньше каталог был
-# 700, и даже своя учётка упиралась в Permission denied. Прав это не добавляет:
-# участник группы docker и так фактически root. Владельца не трогаем — если вы
-# сделали владельцем себя, так и останется.
+# Каталог ноды — владельцу-человеку ($ADMIN_USER): он правит compose без sudo.
+# compose — 600 (внутри SECRET_KEY). Каталог баз — 775: в него пишет ядро
+# (в контейнере root), а смотреть и подкладывать файлы может владелец.
 node_dir_perms() {
     [[ -d /opt/remnanode ]] || return 0
-    getent group docker >/dev/null 2>&1 && chgrp docker /opt/remnanode
-    chmod 750 /opt/remnanode
+    local o="${ADMIN_USER:-}"
+    if [[ -n "$o" ]] && id "$o" &>/dev/null; then
+        chown "$o:$o" /opt/remnanode
+        [[ -f /opt/remnanode/docker-compose.yml ]] && chown "$o:$o" /opt/remnanode/docker-compose.yml
+        [[ -d "$GEODATA_DIR" ]] && chown -R "$o:$o" "$GEODATA_DIR"
+    fi
+    chmod 755 /opt/remnanode
     [[ -f /opt/remnanode/docker-compose.yml ]] && chmod 600 /opt/remnanode/docker-compose.yml
+    [[ -d "$GEODATA_DIR" ]] && chmod 775 "$GEODATA_DIR"
     return 0
 }
 
@@ -2782,17 +2816,17 @@ services:
       - NODE_PORT=$NODE_PORT
       - SECRET_KEY="${REMNA_SECRET}"
 EOF
-    # Свои geo-базы подключаем, только если они уже скачаны: том на
-    # несуществующий файл docker создал бы каталогом, и Xray не стартовал бы.
+    # Свои geo-базы подключаем, только если они уже скачаны: пустой каталог
+    # закрыл бы встроенные в образ базы, и Xray не стартовал бы. Каталог —
+    # целиком и с записью: базы в нём обновляет само ядро (см. 62-geodata).
     if geodata_present; then
         cat <<EOF >> /opt/remnanode/docker-compose.yml
     volumes:
-      - $GEODATA_DIR/geoip.dat:/usr/local/share/xray/geoip.dat:ro
-      - $GEODATA_DIR/geosite.dat:/usr/local/share/xray/geosite.dat:ro
+      - $GEODATA_DIR:/usr/local/share/xray
 EOF
         echo "  Подключены geo-базы из $GEODATA_DIR"
     fi
-    node_dir_perms   # compose — 600 (внутри SECRET_KEY), каталог — 750 с группой docker
+    node_dir_perms   # compose — 600 (внутри SECRET_KEY), владелец — $ADMIN_USER
     node_planned "передеплой ноды установщиком"
     if ! ( cd /opt/remnanode && docker compose up -d ) >>"$SETUP_LOG" 2>&1; then
         echo "  [СБОЙ] docker compose up не отработал (см. $SETUP_LOG)"
@@ -2838,135 +2872,132 @@ comp_node_update() {
 # ===== lib/62-geodata.sh ===============================================
 # ##########################################################################
 #  GEO-БАЗЫ
-#  geoip.dat и geosite.dat от Loyalsoldier для Xray внутри ноды и их
-#  обновление раз в 3 дня (systemd-таймер geo-update.timer)
+#  geoip.dat и geosite.dat от Loyalsoldier для Xray внутри ноды. Установщик
+#  кладёт их один раз, дальше их обновляет само ядро Xray — без перезапуска.
 # ##########################################################################
 
 # Встроенные в образ ноды базы обновляются только вместе с образом. Свежие базы
 # Loyalsoldier выходят каждый день; в них то, по чему маршрутизирует ядро
-# (category-ru, geoip ru и т.д.). Поэтому качаем их сами и подключаем томами.
+# (category-ru, geoip ru и т.д.). Поэтому подключаем свои.
+#
+# Обновляет их ядро: в конфиг-профиле панели блок geodata (cron, outbound,
+# assets). Xray качает файл во временный рядом, переименовывает на место и
+# перечитывает базы на лету, клиенты не рвутся. Для этого в контейнер
+# подключается весь каталог и с записью: в пофайловый том :ro ядро не запишет,
+# а замену файла через переименование пофайловый том не увидит.
 
 geodata_present() {
     [[ -s "$GEODATA_DIR/geoip.dat" && -s "$GEODATA_DIR/geosite.dat" ]] && return 0
     return 1
 }
 
+# Подключён каталог целиком (как надо), а не отдельные файлы
 geodata_mounted() {
-    grep -q "$GEODATA_DIR/geosite.dat" /opt/remnanode/docker-compose.yml 2>/dev/null
+    grep -qE "^[[:space:]]*-[[:space:]]*$GEODATA_DIR:/usr/local/share/xray[[:space:]]*$" \
+        /opt/remnanode/docker-compose.yml 2>/dev/null
 }
 
-# Скрипт обновления — тот же, что на всех нодах FixError. Он же качает базы
-# при установке (--no-restart): один код на оба случая. Сверяет sha256 с
-# опубликованной суммой; база, не прошедшая проверку, в ноду не попадёт.
-geodata_write_updater() {
-    cat <<SCRIPT > "$GEODATA_BIN"
-#!/bin/bash
-# Обновление баз Loyalsoldier для remnanode (fixerror-node).
-# Запуск: geo-update              обновить и при изменении перезапустить remnanode
-#         geo-update --check      только скачать и проверить, ничего не менять
-#         geo-update --no-restart обновить файлы, ноду не перезапускать (установка)
-set -u
-DIR=$GEODATA_DIR
-URL=$GEODATA_URL
-CHECK=0; NO_RESTART=0
-case "\${1:-}" in --check) CHECK=1 ;; --no-restart) NO_RESTART=1 ;; esac
-# Под systemd вывод и так уходит в журнал — echo только когда вывод идёт не туда,
-# иначе каждая строка в журнале двоится. Сверяем сам вывод с JOURNAL_STREAM
-# (как велит systemd): одной переменной мало, её наследуют и чужие процессы.
-IN_JOURNAL=0
-[ -n "\${JOURNAL_STREAM:-}" ] && [ "\$JOURNAL_STREAM" = "\$(stat -Lc '%d:%i' /proc/\$\$/fd/1 2>/dev/null)" ] && IN_JOURNAL=1
-log(){ [ \$IN_JOURNAL = 1 ] || echo "\$*"; logger -t geo-update "\$*"; }
+# Старая схема: пофайловые тома :ro и таймер geo-update с перезапуском ноды
+geodata_legacy_mount() {
+    grep -q "$GEODATA_DIR/geosite.dat:" /opt/remnanode/docker-compose.yml 2>/dev/null
+}
 
-mkdir -p "\$DIR"
-TMP=\$(mktemp -d /var/tmp/geo.XXXXXX); trap 'rm -rf "\$TMP"' EXIT
-changed=0
-for f in geoip.dat geosite.dat; do
-  if ! curl -fsSL --retry 3 --max-time 300 -o "\$TMP/\$f" "\$URL/\$f" \\
-     || ! curl -fsSL --retry 3 --max-time 60 -o "\$TMP/\$f.sha256sum" "\$URL/\$f.sha256sum"; then
-    log "ОШИБКА: не удалось скачать \$f, базы не тронуты"; exit 1
-  fi
-  want=\$(awk '{print \$1}' "\$TMP/\$f.sha256sum"); got=\$(sha256sum "\$TMP/\$f" | awk '{print \$1}')
-  if [ -z "\$want" ] || [ "\$want" != "\$got" ]; then
-    log "ОШИБКА: \$f не прошёл проверку sha256, базы не тронуты"; exit 1
-  fi
-  if ! cmp -s "\$TMP/\$f" "\$DIR/\$f"; then
-    changed=1; log "\$f: есть новая версия (\$(du -h "\$TMP/\$f" | cut -f1))"
-  fi
-done
+geodata_legacy_timer() {
+    systemctl is-enabled --quiet geo-update.timer 2>/dev/null
+}
 
-[ \$CHECK -eq 1 ] && { log "проверка: скачано и проверено, изменения=\$changed, ничего не менял"; exit 0; }
-[ \$changed -eq 0 ] && { log "базы не изменились, перезапуск не нужен"; exit 0; }
+# Том баз в compose ноды: пофайловые строки старой схемы заменяются одной
+# строкой каталога; если томов нет вовсе — секция дописывается в конец.
+# Бэкап compose — рядом, с датой.
+geodata_compose_fix() {
+    local c="$1" line="      - $GEODATA_DIR:/usr/local/share/xray"
+    cp -a "$c" "$c.bak.$(date +%Y%m%d%H%M%S)"
+    if grep -q "$GEODATA_DIR/geo" "$c"; then
+        awk -v line="$line" -v d="$GEODATA_DIR/geo" '
+            index($0, d) { if (!done) { print line; done=1 }; next }
+            { print }' "$c" > "$c.new" || return 1
+    elif grep -qE '^[[:space:]]+volumes:' "$c"; then
+        awk -v line="$line" '{ print } /^[[:space:]]+volumes:/ { print line }' "$c" > "$c.new" || return 1
+    else
+        { cat "$c"; echo "    volumes:"; echo "$line"; } > "$c.new" || return 1
+    fi
+    chmod 600 "$c.new"; mv -f "$c.new" "$c"
+    grep -qxF -- "$line" "$c"
+}
 
-# Пишем поверх тех же файлов: в контейнер они подключены пофайлово,
-# замена файла через mv контейнер бы не увидел
-for f in geoip.dat geosite.dat; do cp "\$TMP/\$f" "\$DIR/\$f"; chmod 644 "\$DIR/\$f"; done
-[ \$NO_RESTART -eq 1 ] && { log "базы обновлены, нода не перезапускалась (--no-restart)"; exit 0; }
-[ -x $NOTIFY_BIN ] && $NOTIFY_BIN --planned "обновление баз Loyalsoldier"
-docker restart remnanode >/dev/null
-sleep 10
-st=\$(docker inspect -f '{{.State.Status}}' remnanode 2>/dev/null)
-log "базы обновлены, remnanode перезапущен, статус: \$st"
-[ "\$st" = running ]
-SCRIPT
-    chmod 755 "$GEODATA_BIN"
+# Первая загрузка баз. Сверяет sha256 с опубликованной суммой: база, не
+# прошедшая проверку, в ноду не попадёт. Кладёт через переименование, как и
+# само ядро, — нода, если уже работает, читает либо старый файл, либо новый.
+geodata_download() {
+    local tmp f want got changed=0
+    mkdir -p "$GEODATA_DIR"
+    tmp=$(mktemp -d "$GEODATA_DIR/.dl.XXXXXX") || return 1
+    for f in geoip.dat geosite.dat; do
+        if ! curl -fsSL --retry 3 --max-time 300 -o "$tmp/$f" "$GEODATA_URL/$f" \
+           || ! curl -fsSL --retry 3 --max-time 60 -o "$tmp/$f.sha256sum" "$GEODATA_URL/$f.sha256sum"; then
+            echo "  ОШИБКА: не удалось скачать $f, базы не тронуты"
+            rm -rf "$tmp"; return 1
+        fi
+        want=$(awk '{print $1}' "$tmp/$f.sha256sum")
+        got=$(sha256sum "$tmp/$f" | awk '{print $1}')
+        if [[ -z "$want" || "$want" != "$got" ]]; then
+            echo "  ОШИБКА: $f не прошёл проверку sha256, базы не тронуты"
+            rm -rf "$tmp"; return 1
+        fi
+    done
+    for f in geoip.dat geosite.dat; do
+        if cmp -s "$tmp/$f" "$GEODATA_DIR/$f"; then continue; fi
+        chmod 644 "$tmp/$f"
+        mv -f "$tmp/$f" "$GEODATA_DIR/$f"
+        changed=1
+    done
+    rm -rf "$tmp"
+    if [[ $changed -eq 1 ]]; then echo "  Базы скачаны и проверены"
+    else echo "  Базы не изменились"; fi
     return 0
 }
 
-geodata_write_units() {
-    cat <<'UNIT' > "$GEODATA_UNIT"
-[Unit]
-Description=Обновление баз Loyalsoldier для remnanode
-Wants=network-online.target
-After=network-online.target docker.service
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/geo-update
-UNIT
-    # Раз в 3 дня в 04:00 МСК; разброс 15 минут — чтобы ноды не ломились на
-    # GitHub разом и не перезапускались одновременно
-    cat <<'UNIT' > "$GEODATA_TIMER"
-[Unit]
-Description=Обновление баз Loyalsoldier раз в 3 дня в 04:00 МСК
-
-[Timer]
-OnCalendar=*-*-01/3 01:00:00 UTC
-RandomizedDelaySec=15min
-Persistent=false
-
-[Install]
-WantedBy=timers.target
-UNIT
-    return 0
+# Блок для конфиг-профиля панели: его вставляют в профиль сами, установщик
+# в панель не ходит. Одна строка на вывод — чтобы скопировать целиком.
+geodata_profile_block() {
+    printf '"geodata": {"cron": "17 1 * * *", "outbound": "DIRECT", "assets": [{"url": "%s/geoip.dat", "file": "geoip.dat"}, {"url": "%s/geosite.dat", "file": "geosite.dat"}]}\n' \
+        "$GEODATA_URL" "$GEODATA_URL"
 }
 
 comp_geodata() {
     echo ">>> Geo-базы Loyalsoldier..."
-    mkdir -p "$GEODATA_DIR"
-    geodata_write_updater
-    if ! "$GEODATA_BIN" --no-restart; then
-        echo "  [СБОЙ] не удалось скачать базы (журнал: journalctl -t geo-update)"
-        geodata_present || return 1
+    if ! geodata_download; then
+        geodata_present || { echo "  [СБОЙ] баз нет — нода работала бы на встроенных"; return 1; }
         echo "  Прежние базы на месте — продолжаю с ними."
     fi
     geodata_present || { echo "  [СБОЙ] баз нет после скачивания"; return 1; }
     echo "  Базы на месте: $(du -ch "$GEODATA_DIR"/*.dat | tail -1 | cut -f1)"
+    node_dir_perms
 
-    geodata_write_units
-    systemctl daemon-reload >>"$SETUP_LOG" 2>&1
-    systemctl enable --now geo-update.timer >>"$SETUP_LOG" 2>&1 || true
-    if ! systemctl is-enabled --quiet geo-update.timer 2>/dev/null; then
-        echo "  [СБОЙ] таймер geo-update.timer не включился"
-        return 1
+    # Прежнее обновление таймером перезапускало ноду. Теперь базы обновляет
+    # ядро — таймер выключаем, чтобы не было двух обновлений и лишних
+    # перезапусков. Файлы таймера и скрипт не удаляем.
+    if geodata_legacy_timer; then
+        systemctl disable --now geo-update.timer >>"$SETUP_LOG" 2>&1 || true
+        echo "  Старый таймер geo-update выключен (файлы оставлены)"
     fi
-    echo "  Обновление: раз в 3 дня в 01:00 UTC (04:00 МСК), плюс до 15 минут"
 
-    # Нода уже стоит, а тома в compose нет — передеплоим её с томами.
+    # Нода уже стоит, а каталог в compose не подключён — правим том в её
+    # compose (остальное, и SECRET_KEY, не трогаем) и пересоздаём контейнер.
     # В полной установке не нужно: следующим шагом нода и так передеплоится.
     if [[ -z "${RH_FULL_INSTALL:-}" && -f /opt/remnanode/docker-compose.yml ]] && ! geodata_mounted; then
-        echo "  Подключаю базы к уже установленной ноде..."
-        comp_node || return 1
+        echo "  Подключаю каталог баз к уже установленной ноде..."
+        geodata_compose_fix /opt/remnanode/docker-compose.yml || return 1
+        node_planned "подключение каталога geo-баз"
+        if ! ( cd /opt/remnanode && docker compose up -d ) >>"$SETUP_LOG" 2>&1; then
+            echo "  [СБОЙ] docker compose up не отработал (см. $SETUP_LOG)"
+            return 1
+        fi
+        echo "  Нода пересоздана с каталогом баз"
     fi
+    echo "  Обновлять базы будет ядро Xray. Добавьте в конфиг-профиль ноды в панели"
+    echo "  (верхний уровень, рядом с \"inbounds\") этот блок:"
+    echo "    $(geodata_profile_block)"
     return 0
 }
 
@@ -3051,10 +3082,10 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 UNIT
     fi
-    # Geo-базы — те же, что у ноды: их и так раз в 3 дня обновляет geo-update
+    # Geo-базы — те же, что у ноды: их обновляет ядро ноды (блок geodata в профиле)
     mkdir -p "$(dirname "$XRAYC_DROPIN")"
     cat <<UNIT > "$XRAYC_DROPIN"
-# fixerror-node: geo-базы — общие с нодой ($GEODATA_DIR, обновляет geo-update)
+# fixerror-node: geo-базы — общие с нодой ($GEODATA_DIR, обновляет ядро ноды)
 [Service]
 Environment=XRAY_LOCATION_ASSET=$GEODATA_DIR
 UNIT
@@ -3665,6 +3696,9 @@ notify_write_script() {
 #   remnawave-notify --watch           — нода: следить за контейнером remnanode (служба systemd)
 #   remnawave-notify --planned "что"   — нода: предупредить, что remnanode сейчас перезапустят
 #                                        намеренно; --watch тогда не шлёт «нода упала»
+#   remnawave-notify --reboot-check    — сообщить, что после обновлений нужна перезагрузка
+#                                        (сразу, потом раз в 7 дней, пока не перезагрузят);
+#                                        на ноде его зовёт --watch раз в 6 часов, на панели — --run-backup
 #
 # Настройки (TG_BOT_TOKEN, TG_CHAT_ID, TG_TOPIC_ID, TG_PROXY, SERVER_LABEL, SERVER_IP, NOTIFY_ENABLED):
 #   на панели — /opt/remnawave/host/notify.env, на ноде — /etc/remnawave-notify.env.
@@ -3676,6 +3710,7 @@ else ENV_FILE=/etc/remnawave-notify.env; fi
 [ -r "$ENV_FILE" ] && . "$ENV_FILE"
 
 PLANNED=/run/remnawave-notify.planned   # метка планового перезапуска
+REBOOT_SENT=/var/lib/remnawave-notify.reboot   # когда последний раз напоминали о перезагрузке
 DOWN=/run/remnawave-notify.down         # метка «нода лежит, уже сообщили»
 
 send() {
@@ -3727,10 +3762,20 @@ case "${1:-}" in
 Подробности: <code>$LOG</code>"
         fi
         fresh=$(find /opt/rw-backup-restore/backup -maxdepth 1 -name '*.tar.gz' -mmin -120 2>/dev/null | head -n 1)
-        [ -n "$fresh" ] || send "⚠️ <b>Нет свежего бэкапа</b>: нового архива нет больше 2 часов" ;;
+        [ -n "$fresh" ] || send "⚠️ <b>Нет свежего бэкапа</b>: нового архива нет больше 2 часов"
+        "$0" --reboot-check ;;
+    --reboot-check)
+        # Ядро и библиотеки обновляются сами, но в силу вступают только после перезагрузки
+        [ -f /var/run/reboot-required ] || { rm -f "$REBOOT_SENT"; exit 0; }
+        [ -n "$(find "$REBOOT_SENT" -mtime -7 2>/dev/null)" ] && exit 0
+        pk=$(sort -u /var/run/reboot-required.pkgs 2>/dev/null | head -5 | tr '\n' ' ' | sed 's/ $//')
+        send "♻️ <b>Нужна перезагрузка</b> после обновлений${pk:+: <code>$pk</code>}
+Перезагрузите, когда удобно: <code>sudo reboot</code>" && touch "$REBOOT_SENT" ;;
     --planned)
         printf '%s' "${2:-плановые работы}" > "$PLANNED" ;;
     --watch)
+        # Раз в 6 часов — не нужна ли перезагрузка (фоновый цикл живёт вместе со службой)
+        ( while :; do "$0" --reboot-check; sleep 21600; done ) &
         # docker events отдаёт события контейнера remnanode; при падении — тревога,
         # при плановом перезапуске — одно спокойное сообщение после подъёма
         docker events --filter container=remnanode --filter event=start --filter event=die \
@@ -3752,7 +3797,7 @@ case "${1:-}" in
         done
         exit 1 ;;   # docker events завершился (перезапуск docker) — systemd запустит заново
     "")
-        echo "Использование: $0 \"текст\" | --ssh-login | --boot | --run-backup | --watch | --planned \"что\"" >&2
+        echo "Использование: $0 \"текст\" | --ssh-login | --boot | --run-backup | --watch | --planned \"что\" | --reboot-check" >&2
         exit 1 ;;
     *)
         send "$1" ;;
@@ -4354,14 +4399,10 @@ repair_node_pull() {
     return 1
 }
 
-repair_geodata_timer() {
-    geodata_write_updater
-    geodata_write_units
-    systemctl daemon-reload >>"$SETUP_LOG" 2>&1
-    systemctl enable --now geo-update.timer >>"$SETUP_LOG" 2>&1 || true
-    systemctl is-enabled --quiet geo-update.timer 2>/dev/null || { echo "  [СБОЙ] таймер не включился"; return 1; }
-    echo "  Таймер geo-update включён: $(systemctl show -p NextElapseUSecRealtime --value geo-update.timer 2>/dev/null)"
-    return 0
+# Переход на обновление баз самим ядром: каталог целиком в compose (передеплой
+# ноды), старый таймер выключается. Базы перекачиваются, если на GitHub новее.
+repair_geodata() {
+    RH_FULL_INSTALL="" comp_geodata
 }
 
 repair_perms() {
@@ -4372,7 +4413,7 @@ repair_perms() {
         [[ -f "$f" ]] && { chmod 600 "$f" || rc=1; }
     done
     [[ -d "$NODE_PULL_DIR" ]] && { chmod 700 "$NODE_PULL_DIR" || rc=1; }
-    echo "  Права приведены к 600 (каталог ноды — 750 с группой docker)."
+    echo "  Права приведены к 600 (каталог ноды — владелец $ADMIN_USER)."
     return $rc
 }
 
@@ -4380,7 +4421,7 @@ repair_perms() {
 # исполняется через /bin/sh, где нет [[ ]], и молча не работает.
 repair_verify() {
     local f bad=""
-    for f in "$NOTIFY_BIN" "$GEODATA_BIN" "$NODE_PULL_BIN" "$RKN_BIN"; do
+    for f in "$NOTIFY_BIN" "$NODE_PULL_BIN" "$RKN_BIN"; do
         [[ -f "$f" ]] || continue
         head -1 "$f" | grep -q '^#!' || bad+=" $(basename "$f")"
     done
@@ -4407,7 +4448,7 @@ repair_build_plan() {
     REPAIR_SKIPS=()
 
     repair_add repair_perms "Права на файлы с секретами" \
-        "chmod 600 на install.conf, notify.env, ключ node-pull, ключ сертификата, лог, отчёт и compose; каталог ноды — 750 с группой docker"
+        "chmod 600 на install.conf, notify.env, ключ node-pull, ключ сертификата, лог, отчёт и compose; каталог ноды — владельцу-админу (755), каталог баз — 775"
 
     if [[ -f "$SSH_HARDEN_FILE" ]]; then
         repair_add repair_ssh_hardening "Харденинг SSH" \
@@ -4437,9 +4478,9 @@ repair_build_plan() {
         repair_note "node-pull — ключа ноды нет, ставится пунктом 2 -> 4"
     fi
 
-    if [[ -f "$GEODATA_DIR/geosite.dat" ]]; then
-        repair_add repair_geodata_timer "Обновление geo-баз" \
-            "перезапишет geo-update и его таймер (раз в 3 дня), включит таймер; базы не перекачивает"
+    if [[ -f /opt/remnanode/docker-compose.yml ]] && { geodata_legacy_mount || geodata_legacy_timer; }; then
+        repair_add repair_geodata "Geo-базы: обновление самим ядром" \
+            "подключит каталог баз в ноду целиком с записью (передеплой ноды, ~10 сек простоя), выключит таймер geo-update"
     fi
 
     if ipv6_off_or_pending && nginx_ipv6_listeners | grep -qx default; then
@@ -4641,6 +4682,21 @@ rh_check() {
         rhc_fix "swap: меню, пункт 2 -> 7"
     else
         rhc_ok "swap: $(swapon --show=SIZE --noheadings 2>/dev/null | tr -d ' \n')"
+    fi
+    local rhc_jmax
+    rhc_jmax=$(systemd-analyze cat-config systemd/journald.conf 2>/dev/null \
+        | grep -E '^[[:space:]]*SystemMaxUse=' | tail -1 | cut -d= -f2)
+    if [[ "$rhc_jmax" == "1G" ]]; then
+        rhc_ok "журнал systemd: до 1 ГБ"
+    else
+        rhc_warn "журнал systemd: лимит ${rhc_jmax:-не задан}, а по образцу 1 ГБ (другой дроп-ин в journald.conf.d перебивает 99-size.conf?)"
+        rhc_fix "журнал: меню, пункт 2 -> 14"
+    fi
+    if systemctl is-active --quiet prometheus-node-exporter 2>/dev/null; then
+        rhc_ok "node_exporter работает (графики сервера в Grafana)"
+    else
+        rhc_warn "node_exporter не работает — графиков сервера в Grafana не будет"
+        rhc_fix "node_exporter: sudo apt install prometheus-node-exporter"
     fi
 
     # ----------------------------------------------------------------------
@@ -4976,26 +5032,30 @@ rh_check() {
             fi
         fi
 
-        # Geo-базы: свои (Loyalsoldier, обновляются cron) или встроенные в образ
+        # Geo-базы: свои (Loyalsoldier, обновляет само ядро) или встроенные в образ
         local rhc_age f
-        if grep -q "$GEODATA_DIR/geosite.dat" "$rhc_compose" 2>/dev/null; then
+        if grep -q "$GEODATA_DIR" "$rhc_compose" 2>/dev/null; then
             for f in geoip.dat geosite.dat; do
                 if [[ ! -s "$GEODATA_DIR/$f" ]]; then
-                    rhc_bad "в compose подключён $GEODATA_DIR/$f, а файла нет — Xray не стартует"
+                    rhc_bad "в compose подключён $GEODATA_DIR, а $f в нём нет — Xray не стартует"
                     rhc_fix "geo-базы: меню, пункт 2 -> 25"
                     continue
                 fi
                 rhc_age=$(( ( $(date +%s) - $(stat -c %Y "$GEODATA_DIR/$f") ) / 86400 ))
-                if [[ "$rhc_age" -gt 7 ]]; then
-                    rhc_warn "$f не обновлялся $rhc_age дн. — журнал: journalctl -t geo-update"
+                if [[ "$rhc_age" -gt 3 ]]; then
+                    rhc_warn "$f не обновлялся $rhc_age дн. — есть ли в конфиг-профиле ноды блок geodata? (docker logs remnanode | grep -i geodata)"
                 else
                     rhc_ok "$f свежий (обновлён $rhc_age дн. назад)"
                 fi
             done
-            if [[ -x "$GEODATA_BIN" ]] && systemctl is-enabled --quiet geo-update.timer 2>/dev/null; then
-                rhc_ok "обновление geo-баз раз в 3 дня включено"
+            if grep -q "$GEODATA_DIR/geo" "$rhc_compose" 2>/dev/null; then
+                rhc_warn "geo-базы подключены пофайлово (:ro) — ядро не сможет их обновить"
+                rhc_fix "geo-базы: меню, пункт 4 (починка)"
             else
-                rhc_warn "geo-базы подключены, но таймер geo-update.timer не включён"
+                rhc_ok "каталог geo-баз подключён целиком — базы обновляет ядро Xray"
+            fi
+            if systemctl is-enabled --quiet geo-update.timer 2>/dev/null; then
+                rhc_warn "включён старый таймер geo-update — он перезапускает ноду, а базы и так обновляет ядро"
                 rhc_fix "geo-базы: меню, пункт 4 (починка)"
             fi
         else
@@ -5374,7 +5434,7 @@ components_menu() {
         echo "11) Telegram-уведомления  12) fail2ban       13) Автообновления"
         echo "21) Время UTC + синхронизация   22) Строка ключа ноды для панели"
         echo "24) Учётка ИИ-агента"
-        echo "25) Geo-базы Loyalsoldier + обновление раз в 3 дня"
+        echo "25) Geo-базы Loyalsoldier (обновляет ядро)"
         echo "26) warp-native (WARP интерфейсом)  27) Psiphon (SOCKS5)"
         echo "28) Защита от проберов РКН (ipset, обновление раз в сутки)"
         echo "29) xray-клиент для Telegram (ноды в РФ, конфиг из подписки)"
