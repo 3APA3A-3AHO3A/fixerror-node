@@ -112,7 +112,7 @@ Repair never touches the firewall or the nginx site config, and never reboots. T
 | MTU | path measured with don't-fragment pings; below 1500 it is pinned by `mtu-<iface>` and set in `daemon.json` |
 | Docker | `daemon.json`: log rotation 10 MB × 3; systemd journal capped at 1 GB |
 | Node | `/opt/remnanode/docker-compose.yml`, host network, the `/opt/remnanode/geodata` directory mounted whole and writable; the node directory belongs to the admin account |
-| Geo databases | the installer puts them in place once (sha256 checked). After that the Xray core updates them from the `geodata` block in the panel config profile: downloads next to the file, renames it into place and reloads without a restart. The installer prints the block at the end of the step; you add it to the profile yourself |
+| Geo databases | the installer puts them in place once (sha256 checked). After that the Xray core updates them from the `geodata` block in the panel config profile: downloads next to the file, renames it into place and reloads without a restart. The installer prints the block at the end of the step; you add it to the profile yourself. Every 15 minutes the databases' age goes to node_exporter (`/etc/cron.d/rwmon-geodata`), so the monitoring warns if they stop updating |
 | Site | Reality: `stub.conf` (self-steal on 127.0.0.1:9443, PROXY protocol). CDN: `<domain>.conf` (443, site + XHTTP to Xray) |
 | node-pull | `/usr/local/sbin/node-pull`, keys in `/etc/node-pull`, `node-pull.timer` |
 | Notifications | `/usr/local/sbin/remnawave-notify` (the same script as on the panel), `/etc/remnawave-notify.env`, `remnawave-notify-watch.service`, `@reboot`, PAM |
