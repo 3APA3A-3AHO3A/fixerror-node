@@ -7,8 +7,9 @@
 - фаервол с блокировкой торрентов, fail2ban;
 - защита от проберов РКН: новые входящие из госсетей и сетей сканеров отбрасываются, списки обновляются раз в сутки;
 - общий шаблон sysctl, замер и закрепление MTU, время UTC;
-- Docker и контейнер ноды с geo-базами Loyalsoldier, базы обновляются раз в 3 дня;
+- Docker и контейнер ноды с geo-базами Loyalsoldier; обновляет их само ядро Xray, без перезапуска ноды;
 - выходы для Xray: WARP на порту 6000, warp-native, Psiphon;
+- для графиков в Grafana и учёта: node_exporter (9100 только для сервера мониторинга), vnstat, etckeeper, lynis, mtr;
 - nginx с сайтом утилит;
 - **node-pull**: сертификат и сайт нода забирает с панели;
 - уведомления в Telegram через `remnawave-notify` (обязательны);
@@ -99,7 +100,7 @@ sudo bash /tmp/setup.sh --repair    # починка без вопросов
 11) Telegram-уведомления  12) fail2ban       13) Автообновления
 21) Время UTC + синхронизация   22) Строка ключа ноды для панели
 24) Учётка ИИ-агента
-25) Geo-базы Loyalsoldier + обновление раз в 3 дня
+25) Geo-базы Loyalsoldier (обновляет ядро)
 26) warp-native           27) Psiphon
 28) Защита от проберов РКН (ipset, обновление раз в сутки)
 29) xray-клиент для Telegram (ноды в РФ, конфиг из подписки)
@@ -118,28 +119,29 @@ sudo bash /tmp/setup.sh --repair    # починка без вопросов
 - группа docker у админ-учётки;
 - `remnawave-notify`, его служба, `@reboot` и строка PAM;
 - скрипт и таймер node-pull;
-- скрипт и таймер geo-update.
+- geo-базы старой схемы (пофайловые тома и таймер geo-update) — переводит на каталог, который обновляет ядро; нода пересоздаётся, это ~10 секунд простоя.
 
-Фаервол, контейнер и конфиг сайта nginx починка не трогает и сервер не перезагружает.
+Фаервол и конфиг сайта nginx починка не трогает и сервер не перезагружает. Контейнер ноды пересоздаётся только в пункте про geo-базы.
 
 ## Что ставится
 
 | Что | Как |
 |---|---|
-| SSH | `/etc/ssh/sshd_config.d/00-hardening.conf`: порт 8422, root и пароли закрыты. Port пишется, только если его нет в основном `sshd_config`: два одинаковых Port дают «Address already in use» |
-| UFW | 8422/tcp (limit), 80/tcp, 443/tcp, 443/udp; 2222/tcp только с IP панели; + `UFW_EXTRA_PORTS` |
+| SSH | `/etc/ssh/sshd_config.d/00-hardening.conf`: порт 8422, root и пароли закрыты, проброс агента и TCP запрещён, журнал входов подробный (`LogLevel VERBOSE`). Port пишется, только если его нет в основном `sshd_config`: два одинаковых Port дают «Address already in use» |
+| UFW | 8422/tcp, 80/tcp, 443/tcp, 443/udp; 2222/tcp только с IP панели; 9100/tcp (node_exporter) только с `MONITOR_IP` (пусто — с IP панели); + `UFW_EXTRA_PORTS`. SSH — allow, а не limit: limit режет частые короткие сессии агентов, перебор и так невозможен (только ключи), остальное ловит fail2ban |
 | Торренты | 6 правил `-m string` в `/etc/ufw/before.rules`, до ESTABLISHED |
 | Проберы РКН | подробно — ниже |
 | fail2ban | sshd: 4 попытки → бан на 24 часа; recidive: бан на неделю |
 | sysctl | `/etc/sysctl.d/99-vpn-tune.conf`: BBR/fq, буферы 16 МБ, conntrack 262144, резерв портов 8422, 2222, 9443, 6000, IPv6 выключен |
 | MTU | путь замеряется пингом без фрагментации; если меньше 1500 — служба `mtu-<интерфейс>` и тот же MTU в `daemon.json` |
 | Docker | `daemon.json`: ротация логов 10 МБ × 3; журнал systemd — до 1 ГБ |
-| Нода | `/opt/remnanode/docker-compose.yml`, network_mode host, базы томами из `/opt/remnanode/geodata` |
-| Geo-базы | `/usr/local/sbin/geo-update` + `geo-update.timer`: раз в 3 дня в 01:00 UTC (04:00 МСК) ± 15 минут; проверка sha256; нода перезапускается, только если базы изменились |
+| Нода | `/opt/remnanode/docker-compose.yml`, network_mode host, каталог `/opt/remnanode/geodata` подключён целиком с записью; владелец каталога ноды — админ-учётка |
+| Geo-базы | установщик кладёт их один раз (с проверкой sha256). Дальше обновляет ядро Xray по блоку `geodata` в конфиг-профиле панели: качает рядом, переименовывает на место и перечитывает без перезапуска. Блок установщик печатает в конце шага, вставить его в профиль нужно самому |
 | Сайт | Reality: `stub.conf` (self-steal на 127.0.0.1:9443, PROXY protocol). CDN: `<домен>.conf` (443, сайт + XHTTP в Xray) |
 | node-pull | `/usr/local/sbin/node-pull`, ключи в `/etc/node-pull`, `node-pull.timer` |
 | Уведомления | `/usr/local/sbin/remnawave-notify` (тот же скрипт, что на панели), `/etc/remnawave-notify.env`, `remnawave-notify-watch.service`, `@reboot`, PAM |
 | Время | UTC, chrony |
+| Учёт и аудит | `prometheus-node-exporter` (графики в Grafana), `vnstat` (трафик), `etckeeper` (история `/etc` в git), `lynis` (аудит раз в сутки), `mtr-tiny` |
 
 ### Защита от проберов РКН
 
@@ -173,7 +175,7 @@ sudo bash /tmp/setup.sh --repair    # починка без вопросов
 | `/etc/fixerror-node/xray-sub.url` | Ссылка подписки для xray-клиента (ноды в РФ) |
 | `/opt/remnanode/docker-compose.yml` | Контейнер ноды, внутри SECRET_KEY |
 
-Файлы с секретами — с правами 600. Журналы служб: `journalctl -t node-pull`, `journalctl -t geo-update`, `journalctl -t rkn-block`, `journalctl -t xray-sub`.
+Файлы с секретами — с правами 600. Журналы служб: `journalctl -t node-pull`, `journalctl -t rkn-block`, `journalctl -t xray-sub`.
 
 ## Разработка
 
@@ -192,7 +194,7 @@ sudo bash /tmp/setup.sh --repair    # починка без вопросов
 | `50-security.sh` | учётки, ключи сервера, SSH, UFW и торренты, fail2ban |
 | `52-rknblock.sh` | защита от проберов РКН: ipset, правило ufw, таймер |
 | `60-node.sh` | Docker и контейнер ноды |
-| `62-geodata.sh` | geo-базы и их таймер |
+| `62-geodata.sh` | geo-базы: первая загрузка, том каталогом, блок для профиля панели |
 | `64-xrayclient.sh` | свой xray-клиент для Telegram и обновление конфига из подписки |
 | `70-web.sh` | сайт nginx и node-pull |
 | `80-notify.sh` | remnawave-notify |
@@ -216,7 +218,7 @@ git push
 - конфиг сайта для обеих ролей и откат, если nginx -t не прошёл;
 - строку ключа для панели;
 - что `remnawave-notify` совпадает байт в байт с эталоном `tests/remnawave-notify.ref`;
-- безопасное обновление geo-баз;
+- первую загрузку geo-баз (битый файл не подменяет рабочий) и перевод тома в compose на каталог;
 - защиту от проберов РКН: разбор списков, исключения, отказ от сломанного списка, подъём наборов при загрузке;
 - что диагностика ничего не меняет.
 

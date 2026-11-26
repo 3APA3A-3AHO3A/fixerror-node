@@ -130,6 +130,9 @@ PasswordAuthentication no
 KbdInteractiveAuthentication no
 PubkeyAuthentication yes
 X11Forwarding no
+LogLevel VERBOSE
+AllowAgentForwarding no
+AllowTcpForwarding no
 EOF
     return 0
 }
@@ -255,6 +258,9 @@ comp_ssh() {
 
 comp_ufw() {
     ask_panel_ip
+    # node_exporter (графики сервера в Grafana) — только для сервера мониторинга
+    local mon="${MONITOR_IP:-$PANEL_IP}"
+    [[ "$mon" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || mon="$PANEL_IP"
     echo ">>> Настройка UFW..."
     # Открываем целевой порт + все, на которых SSH может быть прямо сейчас.
     # Иначе при отложенном применении порта фаервол запер бы нас снаружи.
@@ -283,11 +289,15 @@ comp_ufw() {
         ufw --force reset
         ufw default deny incoming
         ufw default allow outgoing
-        for p in $ssh_ports; do ufw limit "$p/tcp" comment 'SSH'; done
+        # allow, а не limit: limit режет седьмое подключение за 30 секунд, и
+        # агенты с частыми короткими сессиями упирались в него. Перебор паролей
+        # всё равно невозможен (только ключи), а частых гостей банит fail2ban.
+        for p in $ssh_ports; do ufw allow "$p/tcp" comment 'SSH'; done
         ufw allow 80/tcp comment 'HTTP'
         ufw allow 443/tcp comment 'HTTPS'
         ufw allow 443/udp comment 'QUIC / Hysteria2'
         ufw allow from "$PANEL_IP" to any port "$NODE_PORT" proto tcp comment 'API panel'
+        ufw allow from "$mon" to any port 9100 proto tcp comment 'node_exporter'
         for p in ${UFW_EXTRA_PORTS:-}; do ufw allow "$p" comment 'extra'; done
     } >>"$SETUP_LOG" 2>&1
     torrent_rules_apply || return 1

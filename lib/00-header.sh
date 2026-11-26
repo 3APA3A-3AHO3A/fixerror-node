@@ -69,12 +69,10 @@ PSIPHON_PORT="1080"     # SOCKS5 Psiphon (vps-psiphon), им пользуетс�
 # Сторонние установщики выходов — прямо из их репозиториев на GitHub
 WARP_NATIVE_URL="https://raw.githubusercontent.com/distillium/warp-native/main/install.sh"
 PSIPHON_URL="https://raw.githubusercontent.com/Chara-Freedom/vps-psiphon/main/psiphon_install.sh"
-# Geo-базы для Xray внутри ноды (Loyalsoldier): обновление раз в 3 дня
+# Geo-базы для Xray внутри ноды (Loyalsoldier): каталог подключается в
+# контейнер целиком, обновляет базы само ядро (блок geodata в профиле панели)
 GEODATA_DIR="/opt/remnanode/geodata"
 GEODATA_URL="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download"
-GEODATA_BIN="/usr/local/sbin/geo-update"
-GEODATA_UNIT="/etc/systemd/system/geo-update.service"
-GEODATA_TIMER="/etc/systemd/system/geo-update.timer"
 # node-pull: нода забирает с панели wildcard-сертификат и сайт утилит
 # Защита от проберов РКН: входящие соединения из госсетей и сетей сканеров
 # (списки shadow-netlab/traffic-guard-lists) отбрасываются через ipset
@@ -122,7 +120,7 @@ CDN_XHTTP_PORT_DEFAULT="4443"
 SYSCTL_FILE="/etc/sysctl.d/99-vpn-tune.conf"
 FAIL2BAN_JAIL="/etc/fail2ban/jail.local"
 # Группа, по которой скрипт узнаёт учётки ИИ-агентов (Claude и др. через MCP)
-AGENT_GROUP="fx-agents"
+AGENT_GROUP="ai-agents"
 # apt с версии 2.0 умеет сам ждать освобождения блокировки dpkg. Без этого на
 # свежем сервере установщик встречался с первым после загрузки
 # unattended-upgrades, падал на первой же команде — и за ним рушилось всё,
@@ -133,7 +131,7 @@ AGENT_GROUP="fx-agents"
 APT_WAIT=(-o DPkg::Lock::Timeout=600
           -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
 # Пакеты из apt — один список на установку и на отчёт о версиях
-APT_PACKAGES="sudo curl wget unzip git tmux cron ufw fail2ban python3-systemd socat jq nginx openssl dnsutils chrony iproute2 iputils-ping iperf3 btop ncdu"
+APT_PACKAGES="sudo curl wget unzip git tmux cron ufw fail2ban python3-systemd socat jq nginx openssl dnsutils chrony iproute2 iputils-ping iperf3 btop ncdu etckeeper vnstat mtr-tiny lynis prometheus-node-exporter"
 # =================
 
 # RH_LIB_ONLY=1 — загрузить только функции, ничего не выполняя (используется тестами)

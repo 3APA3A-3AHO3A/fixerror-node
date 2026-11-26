@@ -31,17 +31,20 @@ docker_group_member() {
     return 0
 }
 
-# Каталог ноды: 750 и группа docker. Заходить в него и смотреть geo-базы могут
-# админ-учётка и агент (оба в группе docker), а сам docker-compose.yml с
-# SECRET_KEY остаётся 600 — секрет защищён на уровне файла. Раньше каталог был
-# 700, и даже своя учётка упиралась в Permission denied. Прав это не добавляет:
-# участник группы docker и так фактически root. Владельца не трогаем — если вы
-# сделали владельцем себя, так и останется.
+# Каталог ноды — владельцу-человеку ($ADMIN_USER): он правит compose без sudo.
+# compose — 600 (внутри SECRET_KEY). Каталог баз — 775: в него пишет ядро
+# (в контейнере root), а смотреть и подкладывать файлы может владелец.
 node_dir_perms() {
     [[ -d /opt/remnanode ]] || return 0
-    getent group docker >/dev/null 2>&1 && chgrp docker /opt/remnanode
-    chmod 750 /opt/remnanode
+    local o="${ADMIN_USER:-}"
+    if [[ -n "$o" ]] && id "$o" &>/dev/null; then
+        chown "$o:$o" /opt/remnanode
+        [[ -f /opt/remnanode/docker-compose.yml ]] && chown "$o:$o" /opt/remnanode/docker-compose.yml
+        [[ -d "$GEODATA_DIR" ]] && chown -R "$o:$o" "$GEODATA_DIR"
+    fi
+    chmod 755 /opt/remnanode
     [[ -f /opt/remnanode/docker-compose.yml ]] && chmod 600 /opt/remnanode/docker-compose.yml
+    [[ -d "$GEODATA_DIR" ]] && chmod 775 "$GEODATA_DIR"
     return 0
 }
 
@@ -108,17 +111,17 @@ services:
       - NODE_PORT=$NODE_PORT
       - SECRET_KEY="${REMNA_SECRET}"
 EOF
-    # Свои geo-базы подключаем, только если они уже скачаны: том на
-    # несуществующий файл docker создал бы каталогом, и Xray не стартовал бы.
+    # Свои geo-базы подключаем, только если они уже скачаны: пустой каталог
+    # закрыл бы встроенные в образ базы, и Xray не стартовал бы. Каталог —
+    # целиком и с записью: базы в нём обновляет само ядро (см. 62-geodata).
     if geodata_present; then
         cat <<EOF >> /opt/remnanode/docker-compose.yml
     volumes:
-      - $GEODATA_DIR/geoip.dat:/usr/local/share/xray/geoip.dat:ro
-      - $GEODATA_DIR/geosite.dat:/usr/local/share/xray/geosite.dat:ro
+      - $GEODATA_DIR:/usr/local/share/xray
 EOF
         echo "  Подключены geo-базы из $GEODATA_DIR"
     fi
-    node_dir_perms   # compose — 600 (внутри SECRET_KEY), каталог — 750 с группой docker
+    node_dir_perms   # compose — 600 (внутри SECRET_KEY), владелец — $ADMIN_USER
     node_planned "передеплой ноды установщиком"
     if ! ( cd /opt/remnanode && docker compose up -d ) >>"$SETUP_LOG" 2>&1; then
         echo "  [СБОЙ] docker compose up не отработал (см. $SETUP_LOG)"

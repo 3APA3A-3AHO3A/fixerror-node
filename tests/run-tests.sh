@@ -1262,48 +1262,81 @@ else
     bad "починка лезет в nginx, хотя ничего не сломано"
 fi
 rm -rf "$T"
-
 # --------------------------------------------------------------------------
-head_ "31. Geo-базы: обновление без риска"
+head_ "31. Geo-базы: первая загрузка и том каталогом"
 # --------------------------------------------------------------------------
 # «Сервер» с базами — локальный каталог, curl ходит в него через file://.
-# Проверяем три вещи: первая загрузка кладёт файлы; повторная без изменений
-# их не трогает; битый файл (сумма не сходится) не подменяет рабочий.
+# Проверяем: первая загрузка кладёт файлы; повторная без изменений их не
+# трогает; битый файл (сумма не сходится) не подменяет рабочий.
 if command -v sha256sum >/dev/null 2>&1 && curl -fsS "file:///dev/null" >/dev/null 2>&1; then
     GD=$(mktemp -d); SRV="$GD/srv"; DST="$GD/dst"; mkdir -p "$SRV" "$DST"
     for f in geoip.dat geosite.dat; do
         head -c 4096 /dev/urandom > "$SRV/$f"
         (cd "$SRV" && sha256sum "$f" > "$f.sha256sum")
     done
-    RH_LIB_ONLY=1 bash -c '
-        source "'"$ROOT"'/setup.sh"
-        GEODATA_DIR="'"$DST"'"; GEODATA_URL="file://'"$SRV"'"; GEODATA_BIN="'"$GD"'/upd.sh"
-        geodata_write_updater
-    ' >/dev/null 2>&1
-    # Журнал скрипта — logger и stdout; в тесте берём stdout
-    bash "$GD/upd.sh" --no-restart > "$GD/log" 2>&1
+    gd_run() {
+        RH_LIB_ONLY=1 bash -c '
+            source "'"$ROOT"'/setup.sh"
+            GEODATA_DIR="'"$DST"'"; GEODATA_URL="file://'"$SRV"'"
+            geodata_download
+        ' > "$GD/log" 2>&1
+    }
+    gd_run
     if cmp -s "$SRV/geoip.dat" "$DST/geoip.dat" && cmp -s "$SRV/geosite.dat" "$DST/geosite.dat"; then
         ok "первая загрузка кладёт обе базы"
     else
         bad "базы не скачались:"; sed 's/^/      /' "$GD/log" 2>/dev/null
     fi
-    : > "$GD/log"; bash "$GD/upd.sh" --no-restart > "$GD/log" 2>&1
-    if grep -q 'не изменились' "$GD/log" && ! grep -q 'новая версия' "$GD/log"; then ok "без изменений на сервере ничего не перекачивает"
-    else bad "перекачивает одинаковые базы"; fi
+    gd_run
+    if grep -q 'не изменились' "$GD/log"; then ok "без изменений на сервере файлы не трогает"
+    else bad "перекладывает одинаковые базы"; fi
     cp "$DST/geosite.dat" "$GD/good"
-    # На сервере объявлена новая сумма, а лежит файл, который ей не соответствует
     head -c 4096 /dev/urandom > "$SRV/geosite.dat"
     printf '%064d  geosite.dat\n' 1 > "$SRV/geosite.dat.sha256sum"
-    : > "$GD/log"; bash "$GD/upd.sh" --no-restart > "$GD/log" 2>&1 || true
+    gd_run || true
     if cmp -s "$GD/good" "$DST/geosite.dat" && grep -q 'не прошёл проверку sha256' "$GD/log"; then
         ok "битый файл не подменяет рабочий"
     else
         bad "битая база попала в ноду"
     fi
+    if ! ls -A "$DST" | grep -q '^\.dl\.'; then ok "временных каталогов загрузки не остаётся"
+    else bad "в каталоге баз остался временный каталог"; fi
     rm -rf "$GD"
 else
     printf '  — нет sha256sum или curl без file://, пропускаю\n'
 fi
+
+# compose старой схемы (пофайловые :ro) и без томов — оба приводятся к одной
+# строке каталога, остальное (и SECRET_KEY) не меняется
+GC=$(mktemp -d)
+cat > "$GC/old.yml" <<'YML'
+services:
+  remnanode:
+    image: remnawave/node:latest
+    environment:
+      - NODE_PORT=2222
+      - SECRET_KEY="abc"
+    volumes:
+      - /opt/remnanode/geodata/geoip.dat:/usr/local/share/xray/geoip.dat:ro
+      - /opt/remnanode/geodata/geosite.dat:/usr/local/share/xray/geosite.dat:ro
+YML
+head -n 6 "$GC/old.yml" > "$GC/none.yml"
+R=$(RH_LIB_ONLY=1 bash -c '
+    source "'"$ROOT"'/setup.sh"
+    for c in "'"$GC"'/old.yml" "'"$GC"'/none.yml"; do
+        geodata_compose_fix "$c" && echo "fixed:$(basename "$c")"
+    done
+' 2>&1)
+want='      - /opt/remnanode/geodata:/usr/local/share/xray'
+if grep -qx 'fixed:old.yml' <<< "$R" && grep -qx 'fixed:none.yml' <<< "$R" \
+   && [[ $(grep -cF -- "$want" "$GC/old.yml") == 1 && $(grep -cF -- "$want" "$GC/none.yml") == 1 ]] \
+   && ! grep -q ':ro' "$GC/old.yml" && grep -q 'SECRET_KEY="abc"' "$GC/old.yml" \
+   && [[ $(grep -c 'volumes:' "$GC/none.yml") == 1 ]] && ls "$GC"/old.yml.bak.* >/dev/null 2>&1; then
+    ok "том geo-баз в compose приводится к каталогу (с бэкапом), секрет не тронут"
+else
+    bad "правка тома geo-баз в compose:"; sed 's/^/      /' <<< "$R"; sed 's/^/      /' "$GC/old.yml" "$GC/none.yml"
+fi
+rm -rf "$GC"
 
 # --------------------------------------------------------------------------
 head_ "32. Учётка ИИ-агента и версия ноды"

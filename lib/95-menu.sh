@@ -110,7 +110,7 @@ components_menu() {
         echo "11) Telegram-уведомления  12) fail2ban       13) Автообновления"
         echo "21) Время UTC + синхронизация   22) Строка ключа ноды для панели"
         echo "24) Учётка ИИ-агента"
-        echo "25) Geo-базы Loyalsoldier + обновление раз в 3 дня"
+        echo "25) Geo-базы Loyalsoldier (обновляет ядро)"
         echo "26) warp-native (WARP интерфейсом)  27) Psiphon (SOCKS5)"
         echo "28) Защита от проберов РКН (ipset, обновление раз в сутки)"
         echo "29) xray-клиент для Telegram (ноды в РФ, конфиг из подписки)"
