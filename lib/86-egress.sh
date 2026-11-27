@@ -79,6 +79,9 @@ psiphon_socks_addr() {
 
 # Страны, где у Psiphon есть выходы (список из справки vps-psiphon)
 PSIPHON_COUNTRIES="AT AU BE BR CA CH CZ DE DK ES FR GB ID IE IN IT JP NL NO PL RS SE SG US"
+# Страны, где выходы есть, но их мало и Google ставит на них капчу для Gemini
+# (Швейцария, ноябрь 2026: два выхода из трёх) — для таких тоже берём US
+PSIPHON_TO_US="CH"
 
 comp_psiphon() {
     echo ">>> Psiphon (SOCKS5 на порту $PSIPHON_PORT)..."
@@ -105,12 +108,17 @@ comp_psiphon() {
             # туннель так и не поднимется. Берём US, как на нодах в Финляндии.
             echo "  Выходов Psiphon в $region нет — беру US."
             region="US"
+        elif [[ " $PSIPHON_TO_US " == *" $region "* ]]; then
+            echo "  Выходов Psiphon в $region мало, и Gemini на них закрыт капчей — беру US."
+            region="US"
         fi
     fi
     if psiphon_active && [[ -z "${RH_FORCE:-}" ]]; then
         echo "  Уже установлен и работает — не переустанавливаю."
     else
-        local f args=(--no-http --bulk-test-mb 0)
+        # --impersonate: проверка Gemini ходит как браузер, и сторож сам уходит с выхода,
+        # где Google ставит капчу (без него такой выход держится часами)
+        local f args=(--no-http --bulk-test-mb 0 --impersonate)
         [[ -n "$region" ]] && args+=(--region "$region")
         f=$(mktemp)
         if ! curl -fsSL --max-time 60 "$PSIPHON_URL" -o "$f" || ! bash -n "$f"; then
