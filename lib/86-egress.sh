@@ -79,9 +79,12 @@ psiphon_socks_addr() {
 
 # Страны, где у Psiphon есть выходы (список из справки vps-psiphon)
 PSIPHON_COUNTRIES="AT AU BE BR CA CH CZ DE DK ES FR GB ID IE IN IT JP NL NO PL RS SE SG US"
-# Страны, где выходы есть, но их мало и Google ставит на них капчу для Gemini
-# (Швейцария, ноябрь 2026: два выхода из трёх) — для таких тоже берём US
-PSIPHON_TO_US="CH"
+# Страны, где выходы есть, но их мало и Google закрывает на них Gemini
+# (Швейцария, ноябрь 2026: два выхода из трёх, а US-выходы, которые Psiphon
+# выдаёт швейцарским серверам, тоже под капчей) — для таких пул стран:
+# при капче сторож переходит к следующей стране, а не крутится на тех же адресах
+PSIPHON_FEW_EXITS="CH"
+PSIPHON_FEW_EXITS_POOL="SE,NL,DE,US"
 
 comp_psiphon() {
     echo ">>> Psiphon (SOCKS5 на порту $PSIPHON_PORT)..."
@@ -108,9 +111,9 @@ comp_psiphon() {
             # туннель так и не поднимется. Берём US, как на нодах в Финляндии.
             echo "  Выходов Psiphon в $region нет — беру US."
             region="US"
-        elif [[ " $PSIPHON_TO_US " == *" $region "* ]]; then
-            echo "  Выходов Psiphon в $region мало, и Gemini на них закрыт капчей — беру US."
-            region="US"
+        elif [[ " $PSIPHON_FEW_EXITS " == *" $region "* ]]; then
+            echo "  Выходов Psiphon в $region мало, и Gemini на них закрыт — беру пул $PSIPHON_FEW_EXITS_POOL."
+            region="$PSIPHON_FEW_EXITS_POOL"
         fi
     fi
     if psiphon_active && [[ -z "${RH_FORCE:-}" ]]; then
